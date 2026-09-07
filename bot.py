@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 
@@ -14,6 +15,7 @@ from telegram.ext import (
 )
 
 from database import init_db, save_user, update_user_details
+from rag_agent import ask, sync_knowledge
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -24,8 +26,9 @@ logging.basicConfig(level=logging.INFO)
 # Состояния для диалога записи
 FULL_NAME, PHONE = range(2)
 
-# Инициализируем БД при старте
+# Инициализируем БД и загружаем базу знаний при старте
 init_db()
+sync_knowledge()
 
 
 # ----------------------------------------------------------------------
@@ -282,10 +285,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------------------------------------------------
+# /ask — вопрос к RAG-агенту
+# ----------------------------------------------------------------------
+async def ask_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /ask <вопрос> — возвращает ответ RAG-агента."""
+    question = " ".join(context.args)
+
+    if not question:
+        await update.message.reply_text(
+            "💡 Как задать вопрос:\n\n"
+            "Просто напишите: /ask <ваш вопрос>\n\n"
+            "Например:\n/ask что такое бачата?\n/ask сколько стоят абонементы?"
+        )
+        return
+
+    # Ответ с индикатором "печатает..."
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action="typing"
+    )
+
+    # RAG-агент: поиск по базе знаний + генерация ответа LLM
+    answer = await asyncio.to_thread(ask, question, update.effective_user.id)
+    await update.message.reply_text(answer)
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Если пользователь написал просто текст — тоже отвечаем через RAG."""
+    # Игнорируем сообщения внутри диалога записи (их ловит ConversationHandler)
+    if context.user_data.get("booking_active"):
+        return
+
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action="typing"
+    )
+
+    answer = await asyncio.to_thread(ask, update.message.text, update.effective_user.id)
+    await update.message.reply_text(answer)
+
+
+# ----------------------------------------------------------------------
 # /cancel — отмена любого диалога
 # ----------------------------------------------------------------------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отменяет диалог и возвращает главное меню."""
+    context.user_data["booking_active"] = False
     await show_main_menu(
         update, context, text="❌ Диалог отменён. Возвращаюсь в главное меню."
     )
@@ -297,6 +340,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------------
 async def book_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Шаг 1 — запрашиваем имя."""
+    context.user_data["booking_active"] = True
     await update.callback_query.answer()
     await update.callback_query.edit_message_text(
         "✍️ Давайте запишем вас на занятие!\n\n"
@@ -359,6 +403,8 @@ async def book_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Телефон: {phone}\n\n"
         "Мы свяжемся с вами в ближайшее время для подтверждения."
     )
+    # Сбрасываем флаг диалога
+    context.user_data["booking_active"] = False
     await show_main_menu(update, context)
     return ConversationHandler.END
 
@@ -432,16 +478,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Тел.: +375 (29) 351 23 61\n"
             "Тел.: +375 (29) 751 23 61\n\n"
             "🏠 Адреса:\n"
-            "Шорная 20-12Н — [soul.by/zal1/](https://soul.by/zal1/)\n"
-            "Шорная 20-4Н — [soul.by/zal2/](https://soul.by/zal2/)\n\n"
+            "Шорная 20-12Н — https://soul.by/zal1/\n"
+            "Шорная 20-4Н — https://soul.by/zal2/\n\n"
             "🗺️ Карта:\n"
-            "[Открыть на Яндекс.Картах](https://yandex.by/maps/?ll=27.54178400,53.90070400&z=17)"
+            "https://yandex.by/maps/?ll=27.54178400,53.90070400&z=17"
         )
     elif data == "support":
         text = (
             "💬 Задать вопрос\n\n"
-            "Напишите ваш вопрос, и мы ответим в ближайшее время.\n\n"
-            "(Пока эта функция в разработке)"
+            "Просто напишите ваш вопрос сюда — я отвечу!\n\n"
+            "Или используйте команду: /ask <вопрос>"
         )
     elif data == "book":
         # Этот случай обрабатывается ConversationHandler, но на случай
@@ -480,7 +526,11 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("ask", ask_handler))
     application.add_handler(book_conv)
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
+    )
     application.add_handler(CallbackQueryHandler(button_handler))
 
     # Запуск в режиме polling
