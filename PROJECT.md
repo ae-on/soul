@@ -34,3 +34,10 @@
 - utm_source — TEXT (источник перехода)
 - registration_date — DATETIME DEFAULT CURRENT_TIMESTAMP
 - consent_given — BOOLEAN DEFAULT 0
+
+## Модуль регистрации
+- Бот принимает `/start` с параметром utm_source.
+- Сохраняет пользователя в таблицу clients (telegram_id, utm_source).
+- Показывает главное меню.
+- При нажатии «Записаться» запускается диалог (имя → телефон → сохранение в БД с шифрованием).
+- Планируется: подтверждение записи, выбор даты/времени.
