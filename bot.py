@@ -59,13 +59,19 @@ async def show_main_menu(
 # Подменю "Направления"
 # ----------------------------------------------------------------------
 async def show_directions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает подменю с направлениями."""
+    """Показывает подменю со всеми направлениями."""
     query = update.callback_query
     await query.answer()
 
     keyboard = [
-        [InlineKeyboardButton("💃 Бачата", callback_data="bachata_info")],
-        [InlineKeyboardButton("🔥 Трайбл", callback_data="tribal_info")],
+        [InlineKeyboardButton("🔥 Трайбл фьюжн", callback_data="tribal_info")],
+        [InlineKeyboardButton("🩰 Восточный танец", callback_data="oriental_info")],
+        [InlineKeyboardButton("🧘 Йога", callback_data="yoga_info")],
+        [InlineKeyboardButton("💃 Бачата (для пар)", callback_data="bachata_info")],
+        [InlineKeyboardButton("🌿 Цигун", callback_data="qigong_info")],
+        [InlineKeyboardButton("🇮🇳 Индийский танец", callback_data="indian_info")],
+        [InlineKeyboardButton("🏛️ Исторический танец", callback_data="historical_info")],
+        [InlineKeyboardButton("🧘 Пилатес", callback_data="pilates_info")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -79,8 +85,7 @@ async def show_directions_menu(update: Update, context: ContextTypes.DEFAULT_TYP
 # ----------------------------------------------------------------------
 # Описания направлений
 # ----------------------------------------------------------------------
-async def show_bachata_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает описание Бачаты."""
+async def show_tribal_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -90,18 +95,17 @@ async def show_bachata_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     text = (
-        "💃 Бачата\n\n"
-        "Бачата — это чувственный и романтичный парный танец "
-        "родом из Доминиканской Республики. В нашей студии вы "
-        "научитесь уверенно вести и чувствовать партнёра, "
-        "импровизировать и получать удовольствие от движения.\n\n"
-        "Подробнее на сайте: https://soul.by/bachata"
+        "🔥 Трайбл фьюжн (Tribal Fusion)\n\n"
+        "Новый виток развития восточного танца. Это медитативность, "
+        "поиск себя и искусное владение телом. Техника сочетает элементы "
+        "восточного, испанского, индийского и других танцев, предоставляя "
+        "большую свободу для самовыражения.\n\n"
+        "Подробнее: http://soul.by/index.php/tribal/"
     )
     await query.edit_message_text(text, reply_markup=reply_markup)
 
 
-async def show_tribal_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает описание Трайбла."""
+async def show_oriental_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -111,11 +115,146 @@ async def show_tribal_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     text = (
-        "🔥 Трайбл\n\n"
-        "Трайбл (Tribal Fusion) — это завораживающий стиль танца, "
-        "сочетающий элементы восточных, индийских и фламенко-мотивов. "
-        "Акцент на пластику, изоляцию и выразительность каждой детали.\n\n"
-        "Подробнее на сайте: https://soul.by/tribal"
+        "🩰 Восточный танец (Беллиданс)\n\n"
+        "Древнейшая танцевальная техника, которая помогает раскрыть "
+        "женственность, мягкость и сексуальность. Учит находить баланс "
+        "между напряжением и расслаблением, избавляет от последствий стресса.\n\n"
+        "Подробнее: http://soul.by/index.php/vostocniy-tanec/"
+    )
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+
+async def show_yoga_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    text = (
+        "🧘 Йога\n\n"
+        "Практика, направленная на оздоровление организма, поиск его "
+        "скрытых возможностей и создание правильного умственного и "
+        "эмоционального настроя. В студии преподают хатха-йогу, "
+        "адаптированную к нуждам современного человека.\n\n"
+        "Подробнее: http://soul.by/index.php/yoga-minsk/"
+    )
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+
+async def show_bachata_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    text = (
+        "💃 Бачата (для пар)\n\n"
+        "Бачата — это диалог тел, разговор без слов. В студии предлагают "
+        "уникальный формат, где пары проходят весь путь обучения вместе, "
+        "не меняя партнёров. Это идеальный способ укрепить отношения, "
+        "раскрыть новый уровень доверия и гармонии, а также устроить "
+        "необычное свидание. Обучение ведётся с нуля в комфортной и "
+        "дружеской атмосфере.\n\n"
+        "Подробнее: https://soul.by/bachata-minsk/"
+    )
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+
+async def show_qigong_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    text = (
+        "🌿 Цигун\n\n"
+        "«Ци» — поток жизненной энергии, «Гун» — работа. Это система "
+        "плавных, контролируемых движений, управления дыханием и вниманием, "
+        "выросшая из китайской народной медицины. Занятия цигун наполняют "
+        "энергией, дарят здоровье и долголетие, а также способствуют "
+        "спокойствию ума и внутреннему равновесию.\n\n"
+        "Подробнее: https://soul.by/cigun-minsk/"
+    )
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+
+async def show_indian_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    text = (
+        "🇮🇳 Индийский танец\n\n"
+        "Индийский танец — это не просто искусство, а духовная практика, "
+        "воплощающая древнюю мудрость. Подобно йоге, он способен погрузить "
+        "танцора в состояние транса, раскрывая внутреннюю сущность. "
+        "В студии преподают как классический индийский танец, так и "
+        "современный и яркий стиль «Болливуд», а также другие стили: "
+        "Гарба, Дандия, Лавани и Бхангра.\n\n"
+        "Подробнее: https://soul.by/indian-dance-minsk/"
+    )
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+
+async def show_historical_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    text = (
+        "🏛️ Исторический танец\n\n"
+        "Это прекрасная возможность погрузиться в миры любимых книг и "
+        "фильмов, узнать много нового об истории и культуре, завести "
+        "интересные знакомства. Значительную часть исторических танцев "
+        "можно танцевать без особенной физической подготовки, ведь они "
+        "были придуманы для того, чтобы совершенно обычные люди могли "
+        "весело и интересно провести вечер. Вас ожидает: изучение схем "
+        "танцев из исторических сборников, освоение нескольких видов "
+        "вальса, участие в балах и пикниках, основы бального этикета.\n\n"
+        "Подробнее: https://soul.by/historical-dance/"
+    )
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+
+async def show_pilates_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    text = (
+        "🧘 Пилатес\n\n"
+        "Пилатес — это уникальная система физических упражнений, которая "
+        "направлена на оздоровление организма и восстановление естественного "
+        "положения тела в пространстве. Это одна из наиболее щадящих форм "
+        "воздействия на организм, разработанная для реабилитации людей "
+        "после травм позвоночника, поэтому она не имеет практически "
+        "никаких противопоказаний. Пилатес доступен людям любого уровня "
+        "подготовки. Занятия включают работу с основными принципами "
+        "пилатеса: концентрация, мышечный контроль, правильное дыхание, "
+        "плавность движений, а также проработку глубинных мышц, "
+        "служащих «каркасом» для позвоночника.\n\n"
+        "Подробнее: https://soul.by/pilates/"
     )
     await query.edit_message_text(text, reply_markup=reply_markup)
 
@@ -240,12 +379,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Описания направлений ---
+    if data == "tribal_info":
+        await show_tribal_info(update, context)
+        return
+    if data == "oriental_info":
+        await show_oriental_info(update, context)
+        return
+    if data == "yoga_info":
+        await show_yoga_info(update, context)
+        return
     if data == "bachata_info":
         await show_bachata_info(update, context)
         return
-
-    if data == "tribal_info":
-        await show_tribal_info(update, context)
+    if data == "qigong_info":
+        await show_qigong_info(update, context)
+        return
+    if data == "indian_info":
+        await show_indian_info(update, context)
+        return
+    if data == "historical_info":
+        await show_historical_info(update, context)
+        return
+    if data == "pilates_info":
+        await show_pilates_info(update, context)
         return
 
     # --- Возврат в главное меню ---
@@ -255,13 +411,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Остальные пункты ---
     if data == "schedule":
-        text = "📅 Расписание:\n\nПонедельник: 19:00 Бачата\nСреда: 20:00 Йога\nПятница: 19:00 Стретчинг"
+        text = (
+            "📅 Расписание:\n\n"
+            "Понедельник: 19:00 Бачата\n"
+            "Среда: 20:00 Йога\n"
+            "Пятница: 19:00 Стретчинг"
+        )
     elif data == "prices":
-        text = "💰 Абонементы:\n\nРазовое занятие — 500 руб.\n4 занятия — 1800 руб.\n8 занятий — 3200 руб.\nБезлимит на месяц — 6000 руб."
+        text = (
+            "💰 СТОИМОСТЬ АБОНЕМЕНТОВ:\n\n"
+            "▫️ 25 / 30 руб — Разовое (1 / 1.5 часа)\n"
+            "▫️ 90 / 110 руб — 4 занятия (1 / 1.5 часа)\n"
+            "▫️ 145 / 185 руб — 8 занятий (1 / 1.5 часа)\n"
+            "▫️ 185 / 235 руб — 12 занятий (1 / 1.5 часа)"
+        )
     elif data == "info":
-        text = "📍 Адрес: ул. Танцевальная, д. 5\n⏰ Часы работы: 10:00–22:00\n📞 Телефон: +7 (999) 123-45-67"
+        text = (
+            "📍 О СТУДИИ\n\n"
+            "📞 Телефоны:\n"
+            "Тел.: +375 (29) 351 23 61\n"
+            "Тел.: +375 (29) 751 23 61\n\n"
+            "🏠 Адреса:\n"
+            "Шорная 20-12Н — [soul.by/zal1/](https://soul.by/zal1/)\n"
+            "Шорная 20-4Н — [soul.by/zal2/](https://soul.by/zal2/)\n\n"
+            "🗺️ Карта:\n"
+            "[Открыть на Яндекс.Картах](https://yandex.by/maps/?ll=27.54178400,53.90070400&z=17)"
+        )
     elif data == "support":
-        text = "Напишите ваш вопрос, и мы ответим в ближайшее время.\n\n(Пока эта функция в разработке)"
+        text = (
+            "💬 Задать вопрос\n\n"
+            "Напишите ваш вопрос, и мы ответим в ближайшее время.\n\n"
+            "(Пока эта функция в разработке)"
+        )
     elif data == "book":
         # Этот случай обрабатывается ConversationHandler, но на случай
         # если он не сработал — покажем сообщение
