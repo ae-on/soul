@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import os
+from datetime import date, datetime, timedelta
 
+import aiohttp
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -21,7 +23,13 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 
+# WordPress API
+WP_URL = os.getenv("WP_URL", "https://soul.by")
+WP_USER = os.getenv("WP_USER", "")
+WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")
+
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Состояния для диалога записи
 FULL_NAME, PHONE = range(2)
@@ -31,9 +39,271 @@ init_db()
 sync_knowledge()
 
 
-# ----------------------------------------------------------------------
-# Вспомогательная функция — показать главное меню
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# WordPress API: получение и форматирование расписания
+# ---------------------------------------------------------------------------
+
+
+async def get_upcoming_events() -> list[dict]:
+    """
+    GET /wp-json/events-manager/v1/events
+    Возвращает список событий или [] при ошибке.
+    """
+    url = f"{WP_URL}/wp-json/events-manager/v1/events"
+    auth = (
+        aiohttp.BasicAuth(WP_USER, WP_APP_PASSWORD)
+        if WP_USER and WP_APP_PASSWORD
+        else None
+    )
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, auth=auth, timeout=10) as resp:
+                data = await resp.json()
+                items = data.get("items", [])
+                logger.info("WP Events: получено %d событий", len(items))
+                return items
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.error("Ошибка при получении расписания из WP: %s", e)
+        return []
+
+
+def filter_events_by_period(events: list[dict], period: str) -> list[dict]:
+    """
+    Фильтрует события по when.start_date.
+    period: 'today' | 'tomorrow' | 'week' | 'next7'
+    Возвращает отсортированный по (дата, время) список.
+    """
+    today = date.today()
+
+    if period == "today":
+        cutoff_start = today
+        cutoff_end = today + timedelta(days=1)
+    elif period == "tomorrow":
+        cutoff_start = today + timedelta(days=1)
+        cutoff_end = today + timedelta(days=2)
+    elif period == "week":
+        # от сегодня до воскресенья включительно
+        days_until_sun = (6 - today.weekday()) % 7
+        cutoff_start = today
+        cutoff_end = today + timedelta(days=days_until_sun + 1)
+    elif period == "next7":
+        cutoff_start = today
+        cutoff_end = today + timedelta(days=7)
+    else:
+        return []
+
+    filtered = []
+    for ev in events:
+        start_date_str = ev.get("when", {}).get("start_date", "")
+        if not start_date_str:
+            continue
+        try:
+            ev_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if cutoff_start <= ev_date < cutoff_end:
+            filtered.append(ev)
+
+    # Сортировка: сначала по дате, потом по времени
+    def sort_key(ev):
+        when = ev.get("when", {})
+        d = when.get("start_date", "")
+        t = when.get("start_time", "00:00:00")
+        return (d, t)
+
+    filtered.sort(key=sort_key)
+    return filtered
+
+
+# Маппинг slug -> эмодзи
+CATEGORY_EMOJI = {
+    "bachata": "\U0001f483",
+    "yoga": "\U0001f9d8",
+    "tribal": "\U0001f525",
+    "stretching": "\U0001f938",
+}
+
+WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def format_event(ev: dict) -> str:
+    """Форматирует одно событие в строку для Telegram."""
+    when = ev.get("when", {})
+    start_date_str = when.get("start_date", "")
+    start_time_str = when.get("start_time", "")
+
+    # Дата: "Пн, 12.09"
+    try:
+        dt = datetime.strptime(start_date_str, "%Y-%m-%d")
+        day_name = WEEKDAYS_RU[dt.weekday()]
+        date_formatted = f"{dt.day:02d}.{dt.month:02d}"
+        date_line = f"{day_name}, {date_formatted}"
+    except ValueError:
+        date_line = start_date_str
+
+    # Время: "16:30"
+    time_line = start_time_str[:5] if start_time_str else ""
+
+    # Эмодзи по первой категории
+    categories = ev.get("categories", [])
+    slug = categories[0].get("slug", "") if categories else ""
+    emoji = CATEGORY_EMOJI.get(slug, "\U0001f3ab")
+
+    # Название
+    name = ev.get("name", "Без названия")
+
+    # Места
+    bookings = ev.get("bookings", {})
+    if bookings.get("enabled"):
+        available = bookings.get("available_spaces", 0)
+        if available > 0:
+            spaces_str = f"· {available} мест"
+        else:
+            spaces_str = "· ❌ мест нет"
+    else:
+        spaces_str = ""
+
+    parts = [
+        f"{date_line} \u00b7 {time_line}" if time_line else date_line,
+        f"{emoji} {name}",
+    ]
+    if spaces_str:
+        parts.append(spaces_str)
+
+    return " \u00b7 ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Подменю выбора периода расписания
+# ---------------------------------------------------------------------------
+async def show_schedule_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню выбора периода для расписания."""
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [
+            InlineKeyboardButton("\U0001f5d3 Сегодня", callback_data="schedule_today"),
+            InlineKeyboardButton(
+                "\U0001f4c6 Завтра", callback_data="schedule_tomorrow"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f5d3 Эта неделя", callback_data="schedule_week"
+            ),
+            InlineKeyboardButton(
+                "\U0001f4c5 Ближайшие 7 дней", callback_data="schedule_next7"
+            ),
+        ],
+        [InlineKeyboardButton("\U0001f519 Назад в меню", callback_data="back_to_main")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        "\U0001f4c5 Расписание занятий\n\nВыберите период:",
+        reply_markup=reply_markup,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Показ событий за выбранный период
+# ---------------------------------------------------------------------------
+async def show_events_for_period(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, period: str
+):
+    """Загружает события, фильтрует по периоду и выводит список."""
+    query = update.callback_query
+    await query.answer()
+
+    # Загружаем
+    events = await get_upcoming_events()
+    filtered = filter_events_by_period(events, period)
+
+    # Заголовок
+    today = date.today()
+    period_titles = {
+        "today": f"\U0001f5d3 Сегодня, {today.day:02d}.{today.month:02d}",
+        "tomorrow": f"\U0001f4c6 Завтра, {(today + timedelta(days=1)).day:02d}.{(today + timedelta(days=1)).month:02d}",
+        "week": "\U0001f5d3 Эта неделя",
+        "next7": "\U0001f4c5 Ближайшие 7 дней",
+    }
+    title = period_titles.get(period, "Расписание")
+
+    if not filtered:
+        text = f"{title}\n\nПока нет занятий в этом периоде."
+        keyboard = [
+            [InlineKeyboardButton("\U0001f519 К периодам", callback_data="schedule")],
+            [
+                InlineKeyboardButton(
+                    "\U0001f3e0 Главное меню", callback_data="back_to_main"
+                )
+            ],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # Ограничение: максимум 15 событий в одном сообщении
+    MAX_SHOWN = 15
+    shown = filtered[:MAX_SHOWN]
+    hidden_count = len(filtered) - MAX_SHOWN
+
+    lines = [f"**{title}**\n"]
+    for ev in shown:
+        lines.append(format_event(ev))
+
+    if hidden_count > 0:
+        lines.append(f"\n_(показаны первые {MAX_SHOWN} из {len(filtered)})_")
+
+    text = "\n\n".join(lines)
+
+    # Кнопка записи под каждым событием + навигация
+    keyboard = []
+    for ev in shown:
+        ev_id = ev.get("id", 0)
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"\u2705 Записаться — {ev.get('name', '')}",
+                    callback_data=f"book_event_{ev_id}",
+                )
+            ]
+        )
+
+    keyboard.append(
+        [
+            InlineKeyboardButton("\U0001f519 К периодам", callback_data="schedule"),
+            InlineKeyboardButton(
+                "\U0001f3e0 Главное меню", callback_data="back_to_main"
+            ),
+        ]
+    )
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ---------------------------------------------------------------------------
+# Заглушка записи на событие
+# ---------------------------------------------------------------------------
+async def book_event_stub(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: int
+):
+    """Пока заглушка: сообщение, что запись откроется позже."""
+    query = update.callback_query
+    await query.answer()
+
+    text = (
+        f"\u270d\ufe0f Запись на событие #{event_id}\n\n"
+        "\u0420\u0435\u0430\u043b\u044c\u043d\u0430\u044f запись откроется в ближайшее время.\n"
+        "Следите за анонсами!"
+    )
+    keyboard = [
+        [InlineKeyboardButton("\U0001f519 К расписанию", callback_data="schedule")],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
 async def show_main_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None
 ):
@@ -419,6 +689,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
+    # --- Расписание: подменю выбора периода ---
+    if data == "schedule":
+        await show_schedule_menu(update, context)
+        return
+
+    # --- Расписание: показ событий за период ---
+    if data.startswith("schedule_"):
+        period = data[len("schedule_") :]  # today, tomorrow, week, next7
+        if period in ("today", "tomorrow", "week", "next7"):
+            await show_events_for_period(update, context, period)
+        return
+
+    # --- Запись на событие (заглушка) ---
+    if data.startswith("book_event_"):
+        try:
+            event_id = int(data[len("book_event_") :])
+        except ValueError:
+            event_id = 0
+        await book_event_stub(update, context, event_id)
+        return
+
     # --- Подменю "Направления" ---
     if data == "directions":
         await show_directions_menu(update, context)
@@ -456,14 +747,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Остальные пункты ---
-    if data == "schedule":
-        text = (
-            "📅 Расписание:\n\n"
-            "Понедельник: 19:00 Бачата\n"
-            "Среда: 20:00 Йога\n"
-            "Пятница: 19:00 Стретчинг"
-        )
-    elif data == "prices":
+    if data == "prices":
         text = (
             "💰 СТОИМОСТЬ АБОНЕМЕНТОВ:\n\n"
             "▫️ 25 / 30 руб — Разовое (1 / 1.5 часа)\n"
@@ -524,6 +808,19 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+
+    # -----------------------------------------------------------------------
+    # Error handler — логирует необработанные исключения
+    # -----------------------------------------------------------------------
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Логирует ошибки и сообщает пользователю о сбое."""
+        logger.error("Необработанная ошибка:", exc_info=context.error)
+        if update and hasattr(update, "effective_message") and update.effective_message:
+            await update.effective_message.reply_text(
+                "\u26a0\ufe0f Что-то пошло не так. Попробуйте ещё раз или напишите /start."
+            )
+
+    application.add_error_handler(error_handler)
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("ask", ask_handler))
