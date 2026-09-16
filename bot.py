@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import warnings
 from datetime import date, datetime, timedelta
 
 import aiohttp
@@ -14,6 +15,14 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     filters,
+)
+
+# Подавляем предупреждение PTBUserWarning от ConversationHandler
+# (per_message=False по умолчанию, но для нашего диалога это неважно)
+warnings.filterwarnings(
+    "ignore",
+    message=".*If 'per_message=False'.*",
+    category=UserWarning,
 )
 
 from database import init_db, save_user, update_user_details
@@ -127,18 +136,31 @@ CATEGORY_EMOJI = {
 WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
+def filter_events_by_category(events: list[dict], slug: str) -> list[dict]:
+    """
+    Фильтрует события по slug категории (регистронезависимо).
+    """
+    slug_lower = slug.lower()
+    result = []
+    for ev in events:
+        for cat in ev.get("categories", []):
+            if cat.get("slug", "").lower() == slug_lower:
+                result.append(ev)
+                break
+    return result
+
+
 def format_event(ev: dict) -> str:
     """Форматирует одно событие в строку для Telegram."""
     when = ev.get("when", {})
     start_date_str = when.get("start_date", "")
     start_time_str = when.get("start_time", "")
 
-    # Дата: "Пн, 12.09"
+    # Дата: только день недели "Пн"
     try:
         dt = datetime.strptime(start_date_str, "%Y-%m-%d")
         day_name = WEEKDAYS_RU[dt.weekday()]
-        date_formatted = f"{dt.day:02d}.{dt.month:02d}"
-        date_line = f"{day_name}, {date_formatted}"
+        date_line = day_name
     except ValueError:
         date_line = start_date_str
 
@@ -164,10 +186,18 @@ def format_event(ev: dict) -> str:
     else:
         spaces_str = ""
 
+    # Локация
+    location_str = ""
+    location = ev.get("location")
+    if location and isinstance(location, dict) and location.get("name"):
+        location_str = f"· \U0001f4cd {location['name']}"
+
     parts = [
         f"{date_line} \u00b7 {time_line}" if time_line else date_line,
         f"{emoji} {name}",
     ]
+    if location_str:
+        parts.append(location_str)
     if spaces_str:
         parts.append(spaces_str)
 
@@ -192,9 +222,6 @@ async def show_schedule_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [
             InlineKeyboardButton(
                 "\U0001f5d3 Эта неделя", callback_data="schedule_week"
-            ),
-            InlineKeyboardButton(
-                "\U0001f4c5 Ближайшие 7 дней", callback_data="schedule_next7"
             ),
         ],
         [InlineKeyboardButton("\U0001f519 Назад в меню", callback_data="back_to_main")],
@@ -226,7 +253,7 @@ async def show_events_for_period(
     period_titles = {
         "today": f"\U0001f5d3 Сегодня, {today.day:02d}.{today.month:02d}",
         "tomorrow": f"\U0001f4c6 Завтра, {(today + timedelta(days=1)).day:02d}.{(today + timedelta(days=1)).month:02d}",
-        "week": "\U0001f5d3 Эта неделя",
+        "week": "\U0001f4c5 Расписание на неделю",
         "next7": "\U0001f4c5 Ближайшие 7 дней",
     }
     title = period_titles.get(period, "Расписание")
@@ -241,7 +268,7 @@ async def show_events_for_period(
                 )
             ],
         ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
         return
 
     # Ограничение: максимум 15 событий в одном сообщении
@@ -258,9 +285,130 @@ async def show_events_for_period(
 
     text = "\n\n".join(lines)
 
-    # Кнопка записи под каждым событием + навигация
+    # Кнопки: для week — без записи, с днями недели
+    # для today/tomorrow/next7 — с кнопками записи
     keyboard = []
-    for ev in shown:
+
+    if period == "week":
+        # Только текст, без кнопок записи. Добавляем подсказку.
+        text += "\n\n\U0001f447 Для записи выберите день в списке ниже."
+
+        # Ряд кнопок дней недели (только те, у которых есть события)
+        # Собираем, какие дни недели есть в filtered
+        days_with_events = set()
+        for ev in filtered:
+            w = ev.get("when", {})
+            try:
+                d = datetime.strptime(w.get("start_date", ""), "%Y-%m-%d")
+                days_with_events.add(d.weekday())
+            except ValueError:
+                pass
+
+        day_row = []
+        for wd in range(7):
+            if wd in days_with_events:
+                day_row.append(
+                    InlineKeyboardButton(
+                        WEEKDAYS_RU[wd], callback_data=f"schedule_day_{wd}"
+                    )
+                )
+        if day_row:
+            keyboard.append(day_row)
+
+        keyboard.append(
+            [
+                InlineKeyboardButton("\U0001f519 К периодам", callback_data="schedule"),
+                InlineKeyboardButton(
+                    "\U0001f3e0 Главное меню", callback_data="back_to_main"
+                ),
+            ]
+        )
+    else:
+        # today / tomorrow / next7 — с кнопками записи
+        for ev in shown:
+            ev_id = ev.get("id", 0)
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"\u2705 Записаться — {ev.get('name', '')}",
+                        callback_data=f"book_event_{ev_id}",
+                    )
+                ]
+            )
+
+        keyboard.append(
+            [
+                InlineKeyboardButton("\U0001f519 К периодам", callback_data="schedule"),
+                InlineKeyboardButton(
+                    "\U0001f3e0 Главное меню", callback_data="back_to_main"
+                ),
+            ]
+        )
+
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+
+# ---------------------------------------------------------------------------
+# Показ событий за конкретный день недели
+# ---------------------------------------------------------------------------
+async def show_day_events(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, weekday: int
+):
+    """
+    Показывает события на конкретный день недели (0=Пн, 6=Вс).
+    """
+    query = update.callback_query
+    await query.answer()
+
+    # Определяем дату: ближайший такой день недели, начиная с сегодня
+    today = date.today()
+    target = today + timedelta(days=(weekday - today.weekday()) % 7)
+    # Если день уже прошёл на этой неделе — берём следующую неделю
+    if target < today:
+        target += timedelta(days=7)
+
+    target_str = target.strftime("%Y-%m-%d")
+
+    events = await get_upcoming_events()
+    # Фильтруем по конкретной дате
+    day_events = []
+    for ev in events:
+        w = ev.get("when", {})
+        if w.get("start_date") == target_str:
+            day_events.append(ev)
+
+    def sort_key(ev):
+        return ev.get("when", {}).get("start_time", "")
+
+    day_events.sort(key=sort_key)
+
+    title = f"\U0001f5d3 {WEEKDAYS_RU[weekday]}, {target.day:02d}.{target.month:02d}"
+
+    if not day_events:
+        text = f"{title}\n\nПока нет занятий в этот день."
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "\U0001f519 К расписанию на неделю", callback_data="schedule_week"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "\U0001f3e0 Главное меню", callback_data="back_to_main"
+                )
+            ],
+        ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    lines = [f"**{title}**\n"]
+    for ev in day_events:
+        lines.append(format_event(ev))
+
+    text = "\n\n".join(lines)
+
+    keyboard = []
+    for ev in day_events:
         ev_id = ev.get("id", 0)
         keyboard.append(
             [
@@ -273,19 +421,32 @@ async def show_events_for_period(
 
     keyboard.append(
         [
-            InlineKeyboardButton("\U0001f519 К периодам", callback_data="schedule"),
+            InlineKeyboardButton(
+                "\U0001f519 К расписанию на неделю", callback_data="schedule_week"
+            ),
             InlineKeyboardButton(
                 "\U0001f3e0 Главное меню", callback_data="back_to_main"
             ),
         ]
     )
 
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
 
 # ---------------------------------------------------------------------------
-# Заглушка записи на событие
+# Безопасное редактирование сообщения (игнорирует BadRequest "not modified")
 # ---------------------------------------------------------------------------
+async def _safe_edit(query, text: str, reply_markup=None):
+    """Вызывает edit_message_text, игнорируя ошибку 'Message is not modified'."""
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            pass
+        else:
+            raise
+
+
 async def book_event_stub(
     update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: int
 ):
@@ -301,6 +462,103 @@ async def book_event_stub(
     keyboard = [
         [InlineKeyboardButton("\U0001f519 К расписанию", callback_data="schedule")],
     ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# Маппинг: callback_data_info -> (slug, эмодзи, короткое имя)
+# Используется для построения кнопок расписания в описании направления
+DIRECTION_META = {
+    "tribal_info": ("tribal", "\U0001f525", "Трайбл фьюжн"),
+    "oriental_info": ("oriental", "\U0001fa70", "Восточный танец"),
+    "yoga_info": ("yoga", "\U0001f9d8", "Йога"),
+    "bachata_info": ("bachata", "\U0001f483", "Бачата"),
+    "qigong_info": ("qigong", "\U0001f33f", "Цигун"),
+    "indian_info": ("indian", "\U0001f1ee\U0001f1f3", "Индийский танец"),
+    "historical_info": ("historical", "\U0001f3db\ufe0f", "Исторический танец"),
+    "pilates_info": ("pilates", "\U0001f9d8", "Пилатес"),
+}
+
+
+async def show_direction_schedule(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, slug: str
+):
+    """
+    Показывает расписание по направлению (slug) на ближайшие 7 дней.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    # Определяем meta по slug (обратный поиск)
+    callback_key = None
+    name = slug.capitalize()
+    emoji = "\U0001f3ab"
+    for c_key, (c_slug, c_emoji, c_name) in DIRECTION_META.items():
+        if c_slug == slug:
+            callback_key = c_key
+            name = c_name
+            emoji = c_emoji
+            break
+
+    # Получаем и фильтруем события
+    events = await get_upcoming_events()
+    cat_events = filter_events_by_category(events, slug)
+    filtered = filter_events_by_period(cat_events, "next7")
+
+    title = f"{emoji} {name} — ближайшие 7 дней"
+
+    if not filtered:
+        text = f"{title}\n\nПока нет занятий по направлению {name} в ближайшие 7 дней."
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "\U0001f519 Назад",
+                    callback_data=callback_key or f"direction_{slug}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "\U0001f3e0 Главное меню", callback_data="back_to_main"
+                )
+            ],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # Сортируем (filter_events_by_period уже сортирует, но подстрахуемся)
+    def sort_key(ev):
+        w = ev.get("when", {})
+        return (w.get("start_date", ""), w.get("start_time", ""))
+
+    filtered.sort(key=sort_key)
+
+    lines = [f"**{title}**\n"]
+    for ev in filtered:
+        lines.append(format_event(ev))
+
+    text = "\n\n".join(lines)
+
+    keyboard = []
+    for ev in filtered:
+        ev_id = ev.get("id", 0)
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"\u2705 Записаться — {ev.get('name', '')}",
+                    callback_data=f"book_event_{ev_id}",
+                )
+            ]
+        )
+
+    back_btn = callback_key if callback_key else f"direction_{slug}"
+    keyboard.append(
+        [
+            InlineKeyboardButton("\U0001f519 Назад", callback_data=back_btn),
+            InlineKeyboardButton(
+                "\U0001f3e0 Главное меню", callback_data="back_to_main"
+            ),
+        ]
+    )
+
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
@@ -363,12 +621,22 @@ async def show_tribal_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 Ближайшие 7 дней",
+                callback_data="direction_schedule_tribal_next7",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад к направлениям", callback_data="directions"
+            )
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     text = (
-        "🔥 Трайбл фьюжн (Tribal Fusion)\n\n"
+        "\U0001f525 Трайбл фьюжн (Tribal Fusion)\n\n"
         "Новый виток развития восточного танца. Это медитативность, "
         "поиск себя и искусное владение телом. Техника сочетает элементы "
         "восточного, испанского, индийского и других танцев, предоставляя "
@@ -383,12 +651,22 @@ async def show_oriental_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 Ближайшие 7 дней",
+                callback_data="direction_schedule_oriental_next7",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад к направлениям", callback_data="directions"
+            )
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     text = (
-        "🩰 Восточный танец (Беллиданс)\n\n"
+        "\U0001fa70 Восточный танец (Беллиданс)\n\n"
         "Древнейшая танцевальная техника, которая помогает раскрыть "
         "женственность, мягкость и сексуальность. Учит находить баланс "
         "между напряжением и расслаблением, избавляет от последствий стресса.\n\n"
@@ -402,12 +680,22 @@ async def show_yoga_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 Ближайшие 7 дней",
+                callback_data="direction_schedule_yoga_next7",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад к направлениям", callback_data="directions"
+            )
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     text = (
-        "🧘 Йога\n\n"
+        "\U0001f9d8 Йога\n\n"
         "Практика, направленная на оздоровление организма, поиск его "
         "скрытых возможностей и создание правильного умственного и "
         "эмоционального настроя. В студии преподают хатха-йогу, "
@@ -422,12 +710,22 @@ async def show_bachata_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 Ближайшие 7 дней",
+                callback_data="direction_schedule_bachata_next7",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад к направлениям", callback_data="directions"
+            )
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     text = (
-        "💃 Бачата (для пар)\n\n"
+        "\U0001f483 Бачата (для пар)\n\n"
         "Бачата — это диалог тел, разговор без слов. В студии предлагают "
         "уникальный формат, где пары проходят весь путь обучения вместе, "
         "не меняя партнёров. Это идеальный способ укрепить отношения, "
@@ -444,13 +742,23 @@ async def show_qigong_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 Ближайшие 7 дней",
+                callback_data="direction_schedule_qigong_next7",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад к направлениям", callback_data="directions"
+            )
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     text = (
-        "🌿 Цигун\n\n"
-        "«Ци» — поток жизненной энергии, «Гун» — работа. Это система "
+        "\U0001f33f Цигун\n\n"
+        "\u00abЦи\u00bb — поток жизненной энергии, \u00abГун\u00bb — работа. Это система "
         "плавных, контролируемых движений, управления дыханием и вниманием, "
         "выросшая из китайской народной медицины. Занятия цигун наполняют "
         "энергией, дарят здоровье и долголетие, а также способствуют "
@@ -465,17 +773,27 @@ async def show_indian_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 Ближайшие 7 дней",
+                callback_data="direction_schedule_indian_next7",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад к направлениям", callback_data="directions"
+            )
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     text = (
-        "🇮🇳 Индийский танец\n\n"
+        "\U0001f1ee\U0001f1f3 Индийский танец\n\n"
         "Индийский танец — это не просто искусство, а духовная практика, "
         "воплощающая древнюю мудрость. Подобно йоге, он способен погрузить "
         "танцора в состояние транса, раскрывая внутреннюю сущность. "
         "В студии преподают как классический индийский танец, так и "
-        "современный и яркий стиль «Болливуд», а также другие стили: "
+        "современный и яркий стиль \u00abБолливуд\u00bb, а также другие стили: "
         "Гарба, Дандия, Лавани и Бхангра.\n\n"
         "Подробнее: https://soul.by/indian-dance-minsk/"
     )
@@ -487,12 +805,22 @@ async def show_historical_info(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 Ближайшие 7 дней",
+                callback_data="direction_schedule_historical_next7",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад к направлениям", callback_data="directions"
+            )
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     text = (
-        "🏛️ Исторический танец\n\n"
+        "\U0001f3db\ufe0f Исторический танец\n\n"
         "Это прекрасная возможность погрузиться в миры любимых книг и "
         "фильмов, узнать много нового об истории и культуре, завести "
         "интересные знакомства. Значительную часть исторических танцев "
@@ -511,12 +839,22 @@ async def show_pilates_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад к направлениям", callback_data="directions")],
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 Ближайшие 7 дней",
+                callback_data="direction_schedule_pilates_next7",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад к направлениям", callback_data="directions"
+            )
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     text = (
-        "🧘 Пилатес\n\n"
+        "\U0001f9d8 Пилатес\n\n"
         "Пилатес — это уникальная система физических упражнений, которая "
         "направлена на оздоровление организма и восстановление естественного "
         "положения тела в пространстве. Это одна из наиболее щадящих форм "
@@ -526,7 +864,7 @@ async def show_pilates_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "подготовки. Занятия включают работу с основными принципами "
         "пилатеса: концентрация, мышечный контроль, правильное дыхание, "
         "плавность движений, а также проработку глубинных мышц, "
-        "служащих «каркасом» для позвоночника.\n\n"
+        "служащих \u00abкаркасом\u00bb для позвоночника.\n\n"
         "Подробнее: https://soul.by/pilates/"
     )
     await query.edit_message_text(text, reply_markup=reply_markup)
@@ -689,16 +1027,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
+    # Логируем все callback_data для отладки
+    logger.info("Callback: %s", data)
+
     # --- Расписание: подменю выбора периода ---
     if data == "schedule":
         await show_schedule_menu(update, context)
         return
+
+    # --- Расписание: показ событий за конкретный день недели ---
+    # Должен быть ДО общей ветки schedule_, чтобы не перехватилось
+    if data.startswith("schedule_day_"):
+        try:
+            weekday = int(data.split("_")[-1])
+            if 0 <= weekday <= 6:
+                await show_day_events(update, context, weekday)
+                return
+        except (ValueError, IndexError):
+            pass
 
     # --- Расписание: показ событий за период ---
     if data.startswith("schedule_"):
         period = data[len("schedule_") :]  # today, tomorrow, week, next7
         if period in ("today", "tomorrow", "week", "next7"):
             await show_events_for_period(update, context, period)
+        return
+
+    # --- Расписание по направлению (direction_schedule_{slug}_next7) ---
+    if data.startswith("direction_schedule_"):
+        # data = "direction_schedule_bachata_next7"
+        parts = data.split("_")
+        # parts = ["direction", "schedule", "bachata", "next7"]
+        if len(parts) >= 4:
+            slug = parts[2]
+            await show_direction_schedule(update, context, slug)
         return
 
     # --- Запись на событие (заглушка) ---
