@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
 import aiohttp
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -67,7 +68,17 @@ async def get_upcoming_events() -> list[dict]:
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, auth=auth, timeout=10) as resp:
+            async with session.get(
+                url,
+                auth=auth,
+                timeout=10,
+                params={
+                    "scope": "future",
+                    "limit": 100,
+                    "orderby": "event_start_date",
+                    "order": "ASC",
+                },
+            ) as resp:
                 data = await resp.json()
                 items = data.get("items", [])
                 logger.info("WP Events: получено %d событий", len(items))
@@ -205,229 +216,186 @@ def format_event(ev: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Подменю выбора периода расписания
+# Названия месяцев в родительном падеже
 # ---------------------------------------------------------------------------
-async def show_schedule_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает меню выбора периода для расписания."""
-    query = update.callback_query
-    await query.answer()
-
-    keyboard = [
-        [
-            InlineKeyboardButton("\U0001f5d3 Сегодня", callback_data="schedule_today"),
-            InlineKeyboardButton(
-                "\U0001f4c6 Завтра", callback_data="schedule_tomorrow"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "\U0001f5d3 Эта неделя", callback_data="schedule_week"
-            ),
-        ],
-        [InlineKeyboardButton("\U0001f519 Назад в меню", callback_data="back_to_main")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        "\U0001f4c5 Расписание занятий\n\nВыберите период:",
-        reply_markup=reply_markup,
-    )
+MONTHS_GENITIVE = [
+    "",
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+]
 
 
 # ---------------------------------------------------------------------------
-# Показ событий за выбранный период
+# Построение ряда кнопок дней (скользящее окно 7 дней)
 # ---------------------------------------------------------------------------
-async def show_events_for_period(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, period: str
-):
-    """Загружает события, фильтрует по периоду и выводит список."""
-    query = update.callback_query
-    await query.answer()
-
-    # Загружаем
-    events = await get_upcoming_events()
-    filtered = filter_events_by_period(events, period)
-
-    # Заголовок
+def build_days_keyboard(selected_date: date = None) -> list[list[InlineKeyboardButton]]:
+    """
+    Строит ряд из 7 inline-кнопок: сегодня + 6 следующих дней.
+    Дата (число месяца) — только в активной (выбранной) кнопке.
+    """
     today = date.today()
-    period_titles = {
-        "today": f"\U0001f5d3 Сегодня, {today.day:02d}.{today.month:02d}",
-        "tomorrow": f"\U0001f4c6 Завтра, {(today + timedelta(days=1)).day:02d}.{(today + timedelta(days=1)).month:02d}",
-        "week": "\U0001f4c5 Расписание на неделю",
-        "next7": "\U0001f4c5 Ближайшие 7 дней",
-    }
-    title = period_titles.get(period, "Расписание")
+    if selected_date is None:
+        selected_date = today
 
-    if not filtered:
-        text = f"{title}\n\nПока нет занятий в этом периоде."
-        keyboard = [
-            [InlineKeyboardButton("\U0001f519 К периодам", callback_data="schedule")],
-            [
-                InlineKeyboardButton(
-                    "\U0001f3e0 Главное меню", callback_data="back_to_main"
-                )
-            ],
-        ]
-        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
-        return
+    row = []
+    for i in range(7):
+        day = today + timedelta(days=i)
+        day_name = WEEKDAYS_RU[day.weekday()]
+        day_num = day.day
 
-    # Ограничение: максимум 15 событий в одном сообщении
-    MAX_SHOWN = 15
-    shown = filtered[:MAX_SHOWN]
-    hidden_count = len(filtered) - MAX_SHOWN
+        if day == selected_date:
+            if day == today:
+                label = f"[\u00b7{day_name} {day_num}\u00b7]"
+            else:
+                label = f"[{day_name} {day_num}]"
+        elif day == today:
+            label = f"\u00b7{day_name}\u00b7"
+        else:
+            label = day_name
 
-    lines = [f"**{title}**\n"]
-    for ev in shown:
-        lines.append(format_event(ev))
-
-    if hidden_count > 0:
-        lines.append(f"\n_(показаны первые {MAX_SHOWN} из {len(filtered)})_")
-
-    text = "\n\n".join(lines)
-
-    # Кнопки: для week — без записи, с днями недели
-    # для today/tomorrow/next7 — с кнопками записи
-    keyboard = []
-
-    if period == "week":
-        # Только текст, без кнопок записи. Добавляем подсказку.
-        text += "\n\n\U0001f447 Для записи выберите день в списке ниже."
-
-        # Ряд кнопок дней недели (только те, у которых есть события)
-        # Собираем, какие дни недели есть в filtered
-        days_with_events = set()
-        for ev in filtered:
-            w = ev.get("when", {})
-            try:
-                d = datetime.strptime(w.get("start_date", ""), "%Y-%m-%d")
-                days_with_events.add(d.weekday())
-            except ValueError:
-                pass
-
-        day_row = []
-        for wd in range(7):
-            if wd in days_with_events:
-                day_row.append(
-                    InlineKeyboardButton(
-                        WEEKDAYS_RU[wd], callback_data=f"schedule_day_{wd}"
-                    )
-                )
-        if day_row:
-            keyboard.append(day_row)
-
-        keyboard.append(
-            [
-                InlineKeyboardButton("\U0001f519 К периодам", callback_data="schedule"),
-                InlineKeyboardButton(
-                    "\U0001f3e0 Главное меню", callback_data="back_to_main"
-                ),
-            ]
-        )
-    else:
-        # today / tomorrow / next7 — с кнопками записи
-        for ev in shown:
-            ev_id = ev.get("id", 0)
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        f"\u2705 Записаться — {ev.get('name', '')}",
-                        callback_data=f"book_event_{ev_id}",
-                    )
-                ]
+        row.append(
+            InlineKeyboardButton(
+                label,
+                callback_data=f"schedule_day_{day.isoformat()}",
             )
-
-        keyboard.append(
-            [
-                InlineKeyboardButton("\U0001f519 К периодам", callback_data="schedule"),
-                InlineKeyboardButton(
-                    "\U0001f3e0 Главное меню", callback_data="back_to_main"
-                ),
-            ]
         )
 
-    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+    return [row]
 
 
 # ---------------------------------------------------------------------------
-# Показ событий за конкретный день недели
+# Показ расписания на конкретный день (плоский экран, глубина 1)
 # ---------------------------------------------------------------------------
-async def show_day_events(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, weekday: int
+async def show_schedule_day(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, date_str: str = None
 ):
     """
-    Показывает события на конкретный день недели (0=Пн, 6=Вс).
+    Показывает расписание на один день.
+    date_str: 'YYYY-MM-DD' или None (тогда сегодня).
     """
     query = update.callback_query
     await query.answer()
 
-    # Определяем дату: ближайший такой день недели, начиная с сегодня
+    # Определяем выбранную дату
+    if date_str:
+        try:
+            selected_date = date.fromisoformat(date_str)
+        except ValueError:
+            selected_date = date.today()
+    else:
+        selected_date = date.today()
+
     today = date.today()
-    target = today + timedelta(days=(weekday - today.weekday()) % 7)
-    # Если день уже прошёл на этой неделе — берём следующую неделю
-    if target < today:
-        target += timedelta(days=7)
 
-    target_str = target.strftime("%Y-%m-%d")
-
+    # Получаем события
     events = await get_upcoming_events()
-    # Фильтруем по конкретной дате
     day_events = []
+    target_str = selected_date.isoformat()
     for ev in events:
         w = ev.get("when", {})
         if w.get("start_date") == target_str:
             day_events.append(ev)
 
-    def sort_key(ev):
-        return ev.get("when", {}).get("start_time", "")
+    # Сортировка по времени
+    day_events.sort(key=lambda ev: ev.get("when", {}).get("start_time", ""))
 
-    day_events.sort(key=sort_key)
-
-    title = f"\U0001f5d3 {WEEKDAYS_RU[weekday]}, {target.day:02d}.{target.month:02d}"
+    # Собираем текст
+    lines = ["\U0001f4c5 Расписание", ""]
 
     if not day_events:
-        text = f"{title}\n\nПока нет занятий в этот день."
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "\U0001f519 К расписанию на неделю", callback_data="schedule_week"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "\U0001f3e0 Главное меню", callback_data="back_to_main"
-                )
-            ],
-        ]
-        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
-        return
+        lines.append("Пока нет занятий в этот день.")
+    else:
+        for ev in day_events:
+            when = ev.get("when", {})
+            time_str = when.get("start_time", "")[:5]
 
-    lines = [f"**{title}**\n"]
+            categories = ev.get("categories", [])
+            slug = categories[0].get("slug", "") if categories else ""
+            emoji = CATEGORY_EMOJI.get(slug, "\U0001f3ab")
+
+            name = ev.get("name", "Без названия")
+
+            location_str = ""
+            location = ev.get("location")
+            if location and isinstance(location, dict) and location.get("name"):
+                location_str = f" \u00b7 \U0001f4cd {location['name']}"
+
+            line = f"\U0001f555 {time_str} \u00b7 {emoji} {name}{location_str}"
+            lines.append(line)
+
+    # Заголовок дня — ПОСЛЕ списка событий
+    weekday_name = WEEKDAYS_RU[selected_date.weekday()]
+    month_name = MONTHS_GENITIVE[selected_date.month]
+    header = f"\U0001f5d3 {weekday_name}, {selected_date.day} {month_name}"
+    if selected_date == today:
+        header += " \u00b7 \U0001f5d3 Сегодня"
+    lines.append("")
+    lines.append(header)
+
+    text = "\n".join(lines)
+
+    # Клавиатура
+    keyboard = build_days_keyboard(selected_date)
+
+    # Кнопки записи: 2 столбца (Зал 1 слева, Зал 2 справа)
+    left_events = []
+    right_events = []
     for ev in day_events:
-        lines.append(format_event(ev))
+        loc = ev.get("location")
+        loc_name = ""
+        if loc and isinstance(loc, dict) and loc.get("name"):
+            loc_name = loc["name"]
+        if "Зал 2" in loc_name:
+            right_events.append(ev)
+        else:
+            left_events.append(ev)
 
-    text = "\n\n".join(lines)
+    max_len = max(len(left_events), len(right_events))
+    for i in range(max_len):
+        left_btn = None
+        right_btn = None
 
-    keyboard = []
-    for ev in day_events:
-        ev_id = ev.get("id", 0)
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    f"\u2705 Записаться — {ev.get('name', '')}",
-                    callback_data=f"book_event_{ev_id}",
-                )
-            ]
-        )
+        if i < len(left_events):
+            ev = left_events[i]
+            time_str = ev.get("when", {}).get("start_time", "")[:5]
+            name = ev.get("name", "")
+            left_btn = InlineKeyboardButton(
+                f"\u270d\ufe0f {time_str} {name}",
+                callback_data=f"book_event_{ev['id']}",
+            )
+        if i < len(right_events):
+            ev = right_events[i]
+            time_str = ev.get("when", {}).get("start_time", "")[:5]
+            name = ev.get("name", "")
+            right_btn = InlineKeyboardButton(
+                f"\u270d\ufe0f {time_str} {name}",
+                callback_data=f"book_event_{ev['id']}",
+            )
 
+        row = []
+        if left_btn:
+            row.append(left_btn)
+        else:
+            row.append(InlineKeyboardButton(" ", callback_data="noop"))
+        if right_btn:
+            row.append(right_btn)
+        else:
+            row.append(InlineKeyboardButton(" ", callback_data="noop"))
+        keyboard.append(row)
+
+    # Главное меню
     keyboard.append(
-        [
-            InlineKeyboardButton(
-                "\U0001f519 К расписанию на неделю", callback_data="schedule_week"
-            ),
-            InlineKeyboardButton(
-                "\U0001f3e0 Главное меню", callback_data="back_to_main"
-            ),
-        ]
+        [InlineKeyboardButton("\U0001f3e0 Главное меню", callback_data="back_to_main")]
     )
 
     await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
@@ -1030,29 +998,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Логируем все callback_data для отладки
     logger.info("Callback: %s", data)
 
-    # --- Расписание: подменю выбора периода ---
+    # --- Расписание: плоский показ на выбранный день ---
     if data == "schedule":
-        await show_schedule_menu(update, context)
+        await show_schedule_day(update, context, None)
         return
 
-    # --- Расписание: показ событий за конкретный день недели ---
-    # Должен быть ДО общей ветки schedule_, чтобы не перехватилось
+    # --- Расписание: переключение дня по schedule_day_YYYY-MM-DD ---
     if data.startswith("schedule_day_"):
-        try:
-            weekday = int(data.split("_")[-1])
-            if 0 <= weekday <= 6:
-                await show_day_events(update, context, weekday)
-                return
-        except (ValueError, IndexError):
-            pass
-
-    # --- Расписание: показ событий за период ---
-    if data.startswith("schedule_"):
-        period = data[len("schedule_") :]  # today, tomorrow, week, next7
-        if period in ("today", "tomorrow", "week", "next7"):
-            await show_events_for_period(update, context, period)
+        date_str = data[len("schedule_day_") :]
+        await show_schedule_day(update, context, date_str)
         return
 
+    # --- Запись на событие (заглушка) ---
     # --- Расписание по направлению (direction_schedule_{slug}_next7) ---
     if data.startswith("direction_schedule_"):
         # data = "direction_schedule_bachata_next7"
