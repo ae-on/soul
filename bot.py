@@ -144,7 +144,49 @@ CATEGORY_EMOJI = {
     "stretching": "\U0001f938",
 }
 
+CATEGORY_NAMES = {
+    "bachata": "Бачата",
+    "tribal": "Трайбл",
+    "yoga": "Йога",
+    "stretching": "Стретчинг",
+    "qigong": "Цигун",
+    "oriental": "Восточный танец",
+    "indian": "Индийский танец",
+    "historical": "Исторический танец",
+    "pilates": "Пилатес",
+}
+
 WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+# Маппинг: slug направления → slug тега в Events Manager
+# Если тег ещё не создан — ставим None
+DIRECTION_TO_TAG = {
+    "bachata": "bachata",
+    "tribal": "tribal",
+    "yoga": "yoga",
+    "pilates": "pilates",
+    "stretching": None,
+    "qigong": "qigong",
+    "oriental": "vostok",
+    "indian": "indian",
+    "historical": "historical",
+}
+
+# Обратный маппинг: tag_slug → название направления
+TAG_TO_NAME = {
+    "bachata": "Бачата",
+    "tribal": "Трайбл",
+    "yoga": "Йога",
+    "pilates": "Пилатес",
+    "stretching": "Стретчинг",
+    "qigong": "Цигун",
+    "vostok": "Восточный танец",
+    "indian": "Индийский танец",
+    "historical": "Исторический танец",
+}
+
+# Обратный маппинг: tag_slug → direction_slug (для кнопки "К направлению")
+TAG_TO_DIRECTION = {v: k for k, v in DIRECTION_TO_TAG.items() if v}
 
 
 def filter_events_by_category(events: list[dict], slug: str) -> list[dict]:
@@ -238,14 +280,18 @@ MONTHS_GENITIVE = [
 # ---------------------------------------------------------------------------
 # Построение ряда кнопок дней (скользящее окно 7 дней)
 # ---------------------------------------------------------------------------
-def build_days_keyboard(selected_date: date = None) -> list[list[InlineKeyboardButton]]:
+def build_days_keyboard(
+    selected_date: date = None, tag_slug: str = None
+) -> list[list[InlineKeyboardButton]]:
     """
     Строит ряд из 7 inline-кнопок: сегодня + 6 следующих дней.
-    Дата (число месяца) — только в активной (выбранной) кнопке.
+    Если tag_slug указан — добавляет '#slug' к callback_data.
     """
     today = date.today()
     if selected_date is None:
         selected_date = today
+
+    suffix = f"#{tag_slug}" if tag_slug else ""
 
     row = []
     for i in range(7):
@@ -266,7 +312,7 @@ def build_days_keyboard(selected_date: date = None) -> list[list[InlineKeyboardB
         row.append(
             InlineKeyboardButton(
                 label,
-                callback_data=f"schedule_day_{day.isoformat()}",
+                callback_data=f"schedule_day_{day.isoformat()}{suffix}",
             )
         )
 
@@ -277,11 +323,14 @@ def build_days_keyboard(selected_date: date = None) -> list[list[InlineKeyboardB
 # Показ расписания на конкретный день (плоский экран, глубина 1)
 # ---------------------------------------------------------------------------
 async def show_schedule_day(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, date_str: str = None
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    date_str: str = None,
+    tag_slug: str = None,
 ):
     """
     Показывает расписание на один день.
-    date_str: 'YYYY-MM-DD' или None (тогда сегодня).
+    Если tag_slug задан — показывает только события с этим тегом.
     """
     query = update.callback_query
     await query.answer()
@@ -299,6 +348,25 @@ async def show_schedule_day(
 
     # Получаем события
     events = await get_upcoming_events()
+
+    # Фильтр по тегу (если задан)
+    if tag_slug:
+        tag_slug_lower = tag_slug.lower()
+        before = len(events)
+        events = [
+            ev
+            for ev in events
+            if any(
+                t.get("slug", "").lower() == tag_slug_lower for t in ev.get("tags", [])
+            )
+        ]
+        logger.info(
+            "Фильтр по тегу '%s': до=%d, после=%d",
+            tag_slug,
+            before,
+            len(events),
+        )
+
     day_events = []
     target_str = selected_date.isoformat()
     for ev in events:
@@ -309,11 +377,21 @@ async def show_schedule_day(
     # Сортировка по времени
     day_events.sort(key=lambda ev: ev.get("when", {}).get("start_time", ""))
 
-    # Собираем текст
-    lines = ["\U0001f4c5 Расписание", ""]
+    # Заголовок верхний (с тегом, если есть)
+    if tag_slug:
+        tag_name = TAG_TO_NAME.get(tag_slug, tag_slug.capitalize())
+        top_title = f"\U0001f4c5 Расписание \u00b7 {tag_name}"
+    else:
+        top_title = "\U0001f4c5 Расписание"
+
+    lines = [top_title, ""]
 
     if not day_events:
-        lines.append("Пока нет занятий в этот день.")
+        if tag_slug:
+            tag_name = TAG_TO_NAME.get(tag_slug, tag_slug.capitalize())
+            lines.append(f"Пока нет занятий по направлению {tag_name} в этот день.")
+        else:
+            lines.append("Пока нет занятий в этот день.")
     else:
         for ev in day_events:
             when = ev.get("when", {})
@@ -345,7 +423,7 @@ async def show_schedule_day(
     text = "\n".join(lines)
 
     # Клавиатура
-    keyboard = build_days_keyboard(selected_date)
+    keyboard = build_days_keyboard(selected_date, tag_slug)
 
     # Кнопки записи: 2 столбца (Зал 1 слева, Зал 2 справа)
     left_events = []
@@ -393,10 +471,46 @@ async def show_schedule_day(
             row.append(InlineKeyboardButton(" ", callback_data="noop"))
         keyboard.append(row)
 
-    # Главное меню
-    keyboard.append(
-        [InlineKeyboardButton("\U0001f3e0 Главное меню", callback_data="back_to_main")]
-    )
+    # Навигация
+    if tag_slug:
+        # direction_slug для кнопки возврата
+        direction_slug = TAG_TO_DIRECTION.get(tag_slug)
+        if direction_slug:
+            # Ищем callback_key в DIRECTION_META
+            back_to_direction = None
+            for c_key, (c_slug, c_emoji, c_name) in DIRECTION_META.items():
+                if c_slug == direction_slug:
+                    back_to_direction = c_key
+                    break
+            if back_to_direction is None:
+                back_to_direction = f"direction_{direction_slug}"
+
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "\U0001f519 К направлению", callback_data=back_to_direction
+                    ),
+                    InlineKeyboardButton(
+                        "\U0001f3e0 Главное меню", callback_data="back_to_main"
+                    ),
+                ]
+            )
+        else:
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "\U0001f3e0 Главное меню", callback_data="back_to_main"
+                    )
+                ]
+            )
+    else:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f3e0 Главное меню", callback_data="back_to_main"
+                )
+            ]
+        )
 
     await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
@@ -592,7 +706,7 @@ async def show_tribal_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton(
                 "\U0001f4c5 Ближайшие 7 дней",
-                callback_data="direction_schedule_tribal_next7",
+                callback_data="direction_schedule_tribal",
             )
         ],
         [
@@ -622,7 +736,7 @@ async def show_oriental_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [
             InlineKeyboardButton(
                 "\U0001f4c5 Ближайшие 7 дней",
-                callback_data="direction_schedule_oriental_next7",
+                callback_data="direction_schedule_oriental",
             )
         ],
         [
@@ -651,7 +765,7 @@ async def show_yoga_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton(
                 "\U0001f4c5 Ближайшие 7 дней",
-                callback_data="direction_schedule_yoga_next7",
+                callback_data="direction_schedule_yoga",
             )
         ],
         [
@@ -681,7 +795,7 @@ async def show_bachata_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton(
                 "\U0001f4c5 Ближайшие 7 дней",
-                callback_data="direction_schedule_bachata_next7",
+                callback_data="direction_schedule_bachata",
             )
         ],
         [
@@ -713,7 +827,7 @@ async def show_qigong_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton(
                 "\U0001f4c5 Ближайшие 7 дней",
-                callback_data="direction_schedule_qigong_next7",
+                callback_data="direction_schedule_qigong",
             )
         ],
         [
@@ -744,7 +858,7 @@ async def show_indian_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton(
                 "\U0001f4c5 Ближайшие 7 дней",
-                callback_data="direction_schedule_indian_next7",
+                callback_data="direction_schedule_indian",
             )
         ],
         [
@@ -776,7 +890,7 @@ async def show_historical_info(update: Update, context: ContextTypes.DEFAULT_TYP
         [
             InlineKeyboardButton(
                 "\U0001f4c5 Ближайшие 7 дней",
-                callback_data="direction_schedule_historical_next7",
+                callback_data="direction_schedule_historical",
             )
         ],
         [
@@ -810,7 +924,7 @@ async def show_pilates_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton(
                 "\U0001f4c5 Ближайшие 7 дней",
-                callback_data="direction_schedule_pilates_next7",
+                callback_data="direction_schedule_pilates",
             )
         ],
         [
@@ -1003,21 +1117,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_schedule_day(update, context, None)
         return
 
-    # --- Расписание: переключение дня по schedule_day_YYYY-MM-DD ---
+    # --- Расписание: переключение дня по schedule_day_YYYY-MM-DD[#tag] ---
     if data.startswith("schedule_day_"):
-        date_str = data[len("schedule_day_") :]
-        await show_schedule_day(update, context, date_str)
+        raw = data[len("schedule_day_") :]
+        if "#" in raw:
+            date_str, tag_slug = raw.split("#", 1)
+        else:
+            date_str, tag_slug = raw, None
+        await show_schedule_day(update, context, date_str, tag_slug)
         return
 
-    # --- Запись на событие (заглушка) ---
-    # --- Расписание по направлению (direction_schedule_{slug}_next7) ---
+    # --- Расписание по направлению: direction_schedule_{direction_slug} ---
     if data.startswith("direction_schedule_"):
-        # data = "direction_schedule_bachata_next7"
-        parts = data.split("_")
-        # parts = ["direction", "schedule", "bachata", "next7"]
-        if len(parts) >= 4:
-            slug = parts[2]
-            await show_direction_schedule(update, context, slug)
+        direction_slug = data.replace("direction_schedule_", "")
+        tag_slug = DIRECTION_TO_TAG.get(direction_slug)
+        if not tag_slug:
+            await query.edit_message_text(
+                "Расписание по этому направлению пока недоступно."
+            )
+            return
+        await show_schedule_day(update, context, None, tag_slug=tag_slug)
         return
 
     # --- Запись на событие (заглушка) ---
