@@ -4,3 +4,5 @@ cryptography==41.0.7
 aiohttp
 openai>=1.30.0
 pyyaml>=6.0
+aiomysql==0.2.0
+PyMySQL==1.1.0
