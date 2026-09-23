@@ -26,8 +26,8 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-from db.constants import CONSENT_TEXT
-from db.models import CONSENT_TEXT_VERSION, User, UserRole
+from db.constants import CONSENT_TEXT, CONSENT_TEXT_VERSION
+from db.models import User, UserRole
 from rag_agent import ask, sync_knowledge
 
 load_dotenv()
