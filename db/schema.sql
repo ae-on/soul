@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS users (
     phone           VARCHAR(50) NOT NULL DEFAULT '',
     email           VARCHAR(255) DEFAULT NULL,
     role            ENUM('student','teacher','admin','super_admin') NOT NULL DEFAULT 'student',
-    status          ENUM('new','active','expired','archived','inactive') NOT NULL DEFAULT 'new',
+    status          ENUM('new','active','expired','archived','inactive','deleted_data') NOT NULL DEFAULT 'new',
     registered_at   DATETIME NOT NULL COMMENT 'Дата первой регистрации в боте',
     last_activity_at DATETIME DEFAULT NULL COMMENT 'Последняя активность в боте',
     last_visit_at   DATETIME DEFAULT NULL COMMENT 'Последнее посещение занятия',

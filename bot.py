@@ -26,6 +26,7 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+from db.connection import get_connection
 from db.constants import CONSENT_TEXT, CONSENT_TEXT_VERSION
 from db.models import User, UserRole
 from rag_agent import ask, sync_knowledge
@@ -532,18 +533,50 @@ async def _safe_edit(query, text: str, reply_markup=None):
 async def book_event_stub(
     update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: int
 ):
-    """Пока заглушка: сообщение, что запись откроется позже."""
+    """Обработка нажатия «Записаться» на занятие — логика по статусу."""
     query = update.callback_query
     await query.answer()
 
-    text = (
-        f"\u270d\ufe0f Запись на событие #{event_id}\n\n"
-        "\u0420\u0435\u0430\u043b\u044c\u043d\u0430\u044f запись откроется в ближайшее время.\n"
-        "Следите за анонсами!"
-    )
-    keyboard = [
-        [InlineKeyboardButton("\U0001f519 К расписанию", callback_data="schedule")],
-    ]
+    telegram_id = update.effective_user.id
+    user = User.get_by_telegram_id(telegram_id)
+    status = user["status"] if user else "new"
+    email = None
+
+    if status in ("new", "deleted_data"):
+        # Гость — предлагаем регистрацию
+        context.user_data["pending_event_id"] = event_id
+        text = (
+            "\u26a0\ufe0f Чтобы записаться на занятие, нужно пройти регистрацию.\n\n"
+            "После регистрации вы сразу сможете записаться на это занятие.\n"
+            "Продолжить?"
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "\u270d\ufe0f Зарегистрироваться", callback_data="book"
+                )
+            ],
+            [InlineKeyboardButton("\U0001f519 К расписанию", callback_data="schedule")],
+        ]
+    elif status in ("expired", "archived", "inactive"):
+        text = "\u26a0\ufe0f Ваш абонемент закончился. Купите новый, чтобы записаться."
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "\U0001f6cd\ufe0f Купить абонемент", callback_data="prices"
+                )
+            ],
+        ]
+    else:
+        # Активный ученик — заглушка записи
+        text = (
+            f"\u270d\ufe0f Запись на событие #{event_id}\n\n"
+            "Запись откроется в ближайшее время."
+        )
+        keyboard = [
+            [InlineKeyboardButton("\U0001f519 К расписанию", callback_data="schedule")],
+        ]
+
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
@@ -674,8 +707,9 @@ async def show_main_menu(
 async def show_info_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None
 ):
-    """Меню для неавторизованного пользователя."""
+    """Меню для гостя (status='new'/'deleted_data')."""
     keyboard = [
+        [InlineKeyboardButton("\U0001f4c5 Расписание", callback_data="schedule")],
         [InlineKeyboardButton("\U0001f9ed Направления", callback_data="directions")],
         [InlineKeyboardButton("\U0001f4b0 Абонементы и цены", callback_data="prices")],
         [InlineKeyboardButton("\u2139\ufe0f О студии", callback_data="info")],
@@ -701,7 +735,13 @@ async def show_menu_by_role(
 ):
     """
     Отображает меню в зависимости от статуса пользователя и его ролей.
+    Для new/deleted_data — инфо-меню, для остальных — меню ученика.
     """
+    # Если статус new или deleted_data — инфо-меню
+    if user["status"] in ("new", "deleted_data"):
+        await show_info_menu(update, context, text=text or "\U0001f3e0 Меню")
+        return
+
     user_id = user["id"]
     roles = User.get_roles(user_id)
 
@@ -726,58 +766,126 @@ async def show_menu_by_role(
             ]
         )
 
-    if user["status"] == "new":
-        # Гость — не заполнены контакты
-        keyboard.append(
-            [InlineKeyboardButton("\U0001f4c5 Расписание", callback_data="schedule")]
-        )
-        keyboard.append(
-            [InlineKeyboardButton("\U0001f9ed Направления", callback_data="directions")]
-        )
-        keyboard.append(
-            [InlineKeyboardButton("\u2139\ufe0f О студии", callback_data="info")]
-        )
-        keyboard.append(
-            [InlineKeyboardButton("\u270d\ufe0f Регистрация", callback_data="book")]
-        )
-    else:
-        # Ученик (active / expired / archived / inactive)
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    "\U0001f4c5 Расписание и запись", callback_data="schedule"
-                )
-            ]
-        )
-        keyboard.append(
-            [InlineKeyboardButton("\U0001f9ed Направления", callback_data="directions")]
-        )
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    "\U0001f4b0 Мой абонемент", callback_data="my_subscription"
-                )
-            ]
-        )
-        keyboard.append(
-            [InlineKeyboardButton("\U0001f464 Профиль", callback_data="profile")]
-        )
-        keyboard.append(
-            [InlineKeyboardButton("\u2139\ufe0f О студии", callback_data="info")]
-        )
-        keyboard.append(
-            [InlineKeyboardButton("\U0001f4ac Поддержка", callback_data="support")]
-        )
+    # Ученик (active / expired / archived / inactive)
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 Расписание и запись", callback_data="schedule"
+            )
+        ]
+    )
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f9ed Направления", callback_data="directions")]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "\U0001f4b0 Мой абонемент", callback_data="my_subscription"
+            )
+        ]
+    )
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f464 Профиль", callback_data="profile")]
+    )
+    keyboard.append(
+        [InlineKeyboardButton("\u2139\ufe0f О студии", callback_data="info")]
+    )
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f4ac Поддержка", callback_data="support")]
+    )
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if text is None:
-        text = "Выберите действие:"
+        text = "\U0001f3e0 Меню"
 
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
     else:
         await update.message.reply_text(text, reply_markup=reply_markup)
+
+
+# ----------------------------------------------------------------------
+# Профиль пользователя
+# ----------------------------------------------------------------------
+async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает профиль пользователя."""
+    query = update.callback_query
+    await query.answer()
+
+    telegram_id = update.effective_user.id
+    user = User.get_by_telegram_id(telegram_id)
+    if not user:
+        await query.edit_message_text("Ошибка загрузки профиля. Нажмите /start.")
+        return
+
+    text = (
+        f"\U0001f464 Профиль\n\n"
+        f"Имя: {user.get('full_name') or '—'}\n"
+        f"Телефон: {user.get('phone') or '—'}\n"
+        f"Статус: {user.get('status')}\n"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\U0001f5d1\ufe0f Удалить данные", callback_data="confirm_delete"
+            )
+        ],
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="back_to_main")],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def confirm_delete_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрос подтверждения удаления данных."""
+    query = update.callback_query
+    await query.answer()
+
+    text = (
+        "\u26a0\ufe0f Удалить ФИО и телефон?\n\n"
+        "Обезличенная запись (telegram_id, username) останется для истории.\n"
+        "Вы сможете зарегистрироваться снова в любой момент."
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\u2705 Да, удалить", callback_data="profile_delete_yes"
+            )
+        ],
+        [InlineKeyboardButton("\u274c Отмена", callback_data="profile")],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def profile_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Окончательное удаление данных пользователя."""
+    query = update.callback_query
+    await query.answer()
+
+    telegram_id = update.effective_user.id
+    user = User.get_by_telegram_id(telegram_id)
+    if user:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE users SET
+                        full_name = '',
+                        phone = '',
+                        consent_given = 0,
+                        consent_date = NULL,
+                        consent_text_version = NULL,
+                        status = 'deleted_data'
+                    WHERE id = %s""",
+                    (user["id"],),
+                )
+                conn.commit()
+        logger.info("Пользователь %s удалил свои данные", user["id"])
+
+    await query.edit_message_text(
+        "\U0001f5d1\ufe0f Ваши данные удалены.\n\n"
+        "Вы можете зарегистрироваться снова через меню."
+    )
+    await show_info_menu(update, context)
 
 
 # Подменю "Направления"
@@ -1372,9 +1480,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_pilates_info(update, context)
         return
 
-    # --- Возврат в главное меню ---
+    # --- Профиль ---
+    if data == "profile":
+        await show_profile(update, context)
+        return
+    if data == "confirm_delete":
+        await confirm_delete_data(update, context)
+        return
+    if data == "profile_delete_yes":
+        await profile_delete_confirm(update, context)
+        return
+
+    # --- Возврат в меню ---
     if data == "back_to_main":
-        await show_main_menu(update, context)
+        telegram_id = update.effective_user.id
+        user = User.get_by_telegram_id(telegram_id)
+        if user:
+            await show_menu_by_role(update, context, user)
+        else:
+            await show_info_menu(update, context)
         return
 
     # --- Остальные пункты ---
