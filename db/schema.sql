@@ -249,11 +249,11 @@ CREATE TABLE IF NOT EXISTS audit_log (
 -- 12. user_roles — мультироли пользователей
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS user_roles (
-    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    user_id     BIGINT UNSIGNED NOT NULL,
+    id          INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    user_id     INT UNSIGNED NOT NULL,
     role        ENUM('student','teacher','admin','super_admin') NOT NULL,
     granted_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    granted_by  BIGINT UNSIGNED DEFAULT NULL,
+    granted_by  INT UNSIGNED DEFAULT NULL,
     active      TINYINT(1) NOT NULL DEFAULT 1,
 
     PRIMARY KEY (id),
