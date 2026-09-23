@@ -93,6 +93,21 @@ class BaseModel:
 class User(BaseModel):
     TABLE = "users"
 
+    @classmethod
+    def get_roles(cls, user_id: int) -> list[str]:
+        """
+        Возвращает список активных ролей пользователя из таблицы user_roles.
+        Пример: ['student', 'teacher']
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT role FROM user_roles
+                       WHERE user_id = %s AND active = 1""",
+                    (user_id,),
+                )
+                return [row["role"] for row in cur.fetchall()]
+
 
 class SubscriptionType(BaseModel):
     TABLE = "subscription_types"
@@ -132,3 +147,78 @@ class Notification(BaseModel):
 
 class AuditLog(BaseModel):
     TABLE = "audit_log"
+
+
+class UserRole(BaseModel):
+    """Мультироли пользователей."""
+
+    TABLE = "user_roles"
+
+    @classmethod
+    def get_by_user_id(cls, user_id: int) -> list[dict]:
+        """Все роли пользователя (активные и неактивные)."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM user_roles WHERE user_id = %s ORDER BY role",
+                    (user_id,),
+                )
+                return cur.fetchall()
+
+    @classmethod
+    def get_active_roles(cls, user_id: int) -> list[str]:
+        """Список только активных ролей."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT role FROM user_roles
+                       WHERE user_id = %s AND active = 1""",
+                    (user_id,),
+                )
+                return [row["role"] for row in cur.fetchall()]
+
+    @classmethod
+    def grant(cls, user_id: int, role: str, granted_by: int = None) -> int:
+        """
+        Выдать роль пользователю.
+        Если запись уже существует — обновить active=1 и granted_by.
+        Возвращает ID записи.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                # Проверяем, есть ли уже такая запись
+                cur.execute(
+                    "SELECT id FROM user_roles WHERE user_id = %s AND role = %s",
+                    (user_id, role),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    cur.execute(
+                        """UPDATE user_roles
+                           SET active = 1, granted_by = %s
+                           WHERE id = %s""",
+                        (granted_by, existing["id"]),
+                    )
+                    conn.commit()
+                    return existing["id"]
+                else:
+                    cur.execute(
+                        """INSERT INTO user_roles (user_id, role, granted_by)
+                           VALUES (%s, %s, %s)""",
+                        (user_id, role, granted_by),
+                    )
+                    conn.commit()
+                    return cur.lastrowid
+
+    @classmethod
+    def revoke(cls, user_id: int, role: str) -> bool:
+        """Отозвать роль (установить active=0). Вернуть True, если строка изменена."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE user_roles SET active = 0
+                       WHERE user_id = %s AND role = %s AND active = 1""",
+                    (user_id, role),
+                )
+                conn.commit()
+                return cur.rowcount > 0
