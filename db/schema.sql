@@ -10,14 +10,17 @@ CREATE TABLE IF NOT EXISTS users (
     id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     telegram_id     BIGINT UNSIGNED NOT NULL,
     username        VARCHAR(255) DEFAULT NULL COMMENT 'Telegram @username',
-    full_name       VARCHAR(255) NOT NULL,
-    phone           VARCHAR(50) NOT NULL,
+    full_name       VARCHAR(255) NOT NULL DEFAULT '',
+    phone           VARCHAR(50) NOT NULL DEFAULT '',
     email           VARCHAR(255) DEFAULT NULL,
     role            ENUM('student','teacher','admin','super_admin') NOT NULL DEFAULT 'student',
     status          ENUM('new','active','expired','archived','inactive') NOT NULL DEFAULT 'new',
     registered_at   DATETIME NOT NULL COMMENT 'Дата первой регистрации в боте',
     last_activity_at DATETIME DEFAULT NULL COMMENT 'Последняя активность в боте',
     last_visit_at   DATETIME DEFAULT NULL COMMENT 'Последнее посещение занятия',
+    consent_given   TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'Согласие на ПДн',
+    consent_date    DATETIME DEFAULT NULL COMMENT 'Дата согласия',
+    consent_text_version VARCHAR(20) DEFAULT NULL COMMENT 'Версия текста согласия',
     notes           TEXT DEFAULT NULL,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -25,7 +28,8 @@ CREATE TABLE IF NOT EXISTS users (
     UNIQUE INDEX idx_telegram_id (telegram_id),
     INDEX idx_role (role),
     INDEX idx_status (status),
-    INDEX idx_last_visit (last_visit_at)
+    INDEX idx_last_visit (last_visit_at),
+    INDEX idx_consent (consent_given)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------------

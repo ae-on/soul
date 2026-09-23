@@ -108,6 +108,106 @@ class User(BaseModel):
                 )
                 return [row["role"] for row in cur.fetchall()]
 
+    @classmethod
+    def get_by_telegram_id(cls, telegram_id: int) -> Optional[dict]:
+        """Возвращает пользователя по telegram_id или None."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM users WHERE telegram_id = %s",
+                    (telegram_id,),
+                )
+                return cur.fetchone()
+
+    @classmethod
+    def create_or_get(cls, telegram_id: int, username: str = None) -> dict:
+        """
+        Если пользователь есть — вернуть его.
+        Если нет — создать с role='student', status='new'
+        и сразу выдать роль student в user_roles.
+        Возвращает dict пользователя.
+        """
+        existing = cls.get_by_telegram_id(telegram_id)
+        if existing:
+            return existing
+
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """INSERT INTO users
+                       (telegram_id, username, full_name, phone, role, status, registered_at)
+                       VALUES (%s, %s, '', '', 'student', 'new', NOW())""",
+                    (telegram_id, username),
+                )
+                user_id = cur.lastrowid
+                conn.commit()
+
+        # Выдаём роль student в user_roles
+        UserRole.grant(user_id, "student")
+
+        logger.info(
+            "Создан новый пользователь: telegram_id=%s, id=%s", telegram_id, user_id
+        )
+        return cls.get_by_id(user_id)
+
+    @classmethod
+    def update_contacts(cls, user_id: int, full_name: str, phone: str) -> bool:
+        """Обновить ФИО и телефон."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE users
+                       SET full_name = %s, phone = %s
+                       WHERE id = %s""",
+                    (full_name, phone, user_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+
+    @classmethod
+    def set_consent(cls, user_id: int, version: str) -> bool:
+        """
+        Зафиксировать согласие на обработку ПДн.
+        Устанавливает consent_given=1, consent_date=NOW(),
+        consent_text_version=version.
+        """
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE users
+                       SET consent_given = 1,
+                           consent_date = NOW(),
+                           consent_text_version = %s
+                       WHERE id = %s""",
+                    (version, user_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+
+    @classmethod
+    def set_status(cls, user_id: int, status: str) -> bool:
+        """Обновить статус (new, active, expired, archived, inactive)."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET status = %s WHERE id = %s",
+                    (status, user_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+
+    @classmethod
+    def update_activity(cls, user_id: int) -> bool:
+        """Обновить last_activity_at = NOW()."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET last_activity_at = NOW() WHERE id = %s",
+                    (user_id,),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+
 
 class SubscriptionType(BaseModel):
     TABLE = "subscription_types"
