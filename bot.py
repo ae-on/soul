@@ -42,8 +42,8 @@ WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Состояния для диалога записи
-FULL_NAME, PHONE = range(2)
+# Состояния для диалога регистрации
+CONSENT, FULL_NAME, PHONE = range(3)
 
 # Инициализируем FTS5 (база знаний) при старте
 sync_knowledge()
@@ -669,6 +669,31 @@ async def show_main_menu(
 
 
 # ----------------------------------------------------------------------
+# Инфо-меню для гостя (status='new')
+# ----------------------------------------------------------------------
+async def show_info_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None
+):
+    """Меню для неавторизованного пользователя."""
+    keyboard = [
+        [InlineKeyboardButton("\U0001f9ed Направления", callback_data="directions")],
+        [InlineKeyboardButton("\U0001f4b0 Абонементы и цены", callback_data="prices")],
+        [InlineKeyboardButton("\u2139\ufe0f О студии", callback_data="info")],
+        [InlineKeyboardButton("\U0001f4ac Задать вопрос", callback_data="support")],
+        [InlineKeyboardButton("\u270d\ufe0f Регистрация", callback_data="book")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if text is None:
+        text = "\U0001f3e0 Меню"
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup)
+
+
+# ----------------------------------------------------------------------
 # Меню по статусу пользователя
 # ----------------------------------------------------------------------
 async def show_menu_by_role(
@@ -1043,8 +1068,8 @@ async def show_pilates_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /start — создаёт/возвращает пользователя в MySQL,
-    проверяет согласие, показывает меню по статусу.
+    /start — создаёт/возвращает пользователя и показывает меню
+    в зависимости от статуса.
     """
     tg_user = update.effective_user
     utm_source = context.args[0] if context.args else "direct"
@@ -1058,23 +1083,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Обновляем активность
     User.update_activity(user["id"])
 
-    # --- Проверка согласия ---
-    if not user["consent_given"]:
-        welcome = (
-            f"\U0001f44b Привет, {tg_user.first_name}!\n\n"
-            "Для продолжения работы с ботом нам нужно ваше согласие "
-            "на обработку персональных данных.\n\n"
-            f"{CONSENT_TEXT}\n\n"
-            'Нажмите "\u2705 Согласен", чтобы продолжить.'
-        )
-        keyboard = [
-            [InlineKeyboardButton("\u2705 Согласен", callback_data="consent_agree")],
-        ]
-        await update.message.reply_text(
-            welcome, reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-
     # --- Приветствие ---
     welcome = f"\U0001f44b Привет, {tg_user.first_name}!"
     if utm_source == "bachata":
@@ -1082,7 +1090,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         welcome += "\n\nДобро пожаловать в нашу студию танцев и йоги! \U0001f9d8"
 
-    await show_menu_by_role(update, context, user, text=welcome)
+    # Меню по статусу
+    if user["status"] == "new" or not user["consent_given"]:
+        await show_info_menu(update, context, text=welcome)
+    else:
+        await show_menu_by_role(update, context, user, text=welcome)
 
 
 # ----------------------------------------------------------------------
@@ -1128,10 +1140,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /cancel — отмена любого диалога
 # ----------------------------------------------------------------------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отменяет диалог и возвращает главное меню."""
+    """Отменяет диалог и возвращает информационное меню."""
     context.user_data["booking_active"] = False
-    await show_main_menu(
-        update, context, text="❌ Диалог отменён. Возвращаюсь в главное меню."
+    await show_info_menu(
+        update, context, text="\u274c Регистрация отменена. Возвращаюсь в меню."
     )
     return ConversationHandler.END
 
@@ -1140,13 +1152,47 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ConversationHandler: запись на занятие
 # ----------------------------------------------------------------------
 async def book_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 1 — запрашиваем имя."""
+    """
+    Шаг 1 регистрации — показать согласие на ПДн.
+    """
     context.user_data["booking_active"] = True
     await update.callback_query.answer()
+
+    text = (
+        "\u270d\ufe0f Регистрация в студии Soul\n\n"
+        "Перед регистрацией нам нужно ваше согласие на обработку "
+        "персональных данных:\n\n"
+        f"{CONSENT_TEXT}\n\n"
+        'Нажмите "\u2705 Согласен", чтобы продолжить, '
+        "или /cancel чтобы отменить."
+    )
+    keyboard = [
+        [InlineKeyboardButton("\u2705 Согласен", callback_data="consent_agree")],
+    ]
     await update.callback_query.edit_message_text(
-        "✍️ Давайте запишем вас на занятие!\n\n"
+        text, reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CONSENT
+
+
+async def book_consent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обработчик согласия — после нажатия кнопки.
+    Вызывается внутри ConversationHandler.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    telegram_id = update.effective_user.id
+    user = User.get_by_telegram_id(telegram_id)
+    if user:
+        User.set_consent(user["id"], CONSENT_TEXT_VERSION)
+        context.user_data["user_id"] = user["id"]
+
+    await query.edit_message_text(
+        "\u2705 Спасибо! Согласие зафиксировано.\n\n"
         "Шаг 1 из 2. Как вас зовут? (напишите имя и фамилию)\n\n"
-        "Или нажмите /cancel чтобы отменить запись."
+        "Или нажмите /cancel чтобы отменить регистрацию."
     )
     return FULL_NAME
 
@@ -1162,13 +1208,13 @@ async def book_full_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Отлично, {full_name}!\n\n"
         "Шаг 2 из 2. Укажите ваш номер телефона, чтобы мы могли с вами связаться:\n\n"
-        "Или нажмите /cancel чтобы отменить запись."
+        "Или нажмите /cancel чтобы отменить регистрацию."
     )
     return PHONE
 
 
 async def book_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Финал — сохраняем телефон + имя в БД, уведомляем администратора."""
+    """Финал — сохраняем телефон, обновляем статус, уведомляем админа."""
     phone = update.message.text.strip()
     if not phone:
         await update.message.reply_text("Пожалуйста, напишите ваш номер телефона.")
@@ -1177,25 +1223,25 @@ async def book_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_name = context.user_data.get("full_name", "")
     telegram_id = update.effective_user.id
 
-    # Получаем пользователя из MySQL
+    # Получаем или создаём пользователя
     user = User.get_by_telegram_id(telegram_id)
-    if user:
-        # Сохраняем контакты
-        User.update_contacts(user["id"], full_name, phone)
-        # Меняем статус на active
-        User.set_status(user["id"], "active")
-        user_id = user["id"]
-    else:
-        # Если пользователя нет (редкий случай) — создаём
-        user = User.create_or_get(telegram_id, None)
-        User.update_contacts(user["id"], full_name, phone)
-        User.set_status(user["id"], "active")
-        user_id = user["id"]
+    if not user:
+        user = User.create_or_get(telegram_id, update.effective_user.username)
+
+    user_id = user["id"]
+
+    # Сохраняем контакты
+    User.update_contacts(user_id, full_name, phone)
+    # Меняем статус на active
+    User.set_status(user_id, "active")
+    # Если согласие ещё не дано — ставим (на случай, если bypass)
+    if not user.get("consent_given"):
+        User.set_consent(user_id, CONSENT_TEXT_VERSION)
 
     # Уведомление администратору
     if ADMIN_CHAT_ID:
         admin_message = (
-            f"✅ Новая запись на занятие!\n\n"
+            f"\U0001f389 Новый клиент зарегистрирован!\n\n"
             f"Имя: {full_name}\n"
             f"Телефон: {phone}\n"
             f"Telegram ID: {telegram_id}\n"
@@ -1209,16 +1255,15 @@ async def book_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Не удалось отправить уведомление админу: {e}")
 
-    # Показываем подтверждение и возвращаем меню по статусу
+    # Показываем подтверждение и меню ученика
     await update.message.reply_text(
-        f"\u2705 Вы записаны!\n\n"
+        f"\u2705 Регистрация завершена!\n\n"
         f"Имя: {full_name}\n"
         f"Телефон: {phone}\n\n"
-        "Мы свяжемся с вами в ближайшее время для подтверждения."
+        "Добро пожаловать в студию Soul!"
     )
-    # Сбрасываем флаг диалога
     context.user_data["booking_active"] = False
-    # Показываем меню ученика
+    # Перезагружаем пользователя из БД (там уже active)
     user = User.get_by_telegram_id(telegram_id)
     await show_menu_by_role(update, context, user)
     return ConversationHandler.END
@@ -1383,10 +1428,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # ConversationHandler для записи на занятие
+    # ConversationHandler для регистрации
     book_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(book_start, pattern="^book$")],
         states={
+            CONSENT: [CallbackQueryHandler(book_consent, pattern="^consent_agree$")],
             FULL_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, book_full_name)
             ],
