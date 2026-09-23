@@ -26,7 +26,8 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-from database import init_db, save_user, update_user_details
+from db.constants import CONSENT_TEXT
+from db.models import CONSENT_TEXT_VERSION, User, UserRole
 from rag_agent import ask, sync_knowledge
 
 load_dotenv()
@@ -44,8 +45,7 @@ logger = logging.getLogger(__name__)
 # Состояния для диалога записи
 FULL_NAME, PHONE = range(2)
 
-# Инициализируем БД и загружаем базу знаний при старте
-init_db()
+# Инициализируем FTS5 (база знаний) при старте
 sync_knowledge()
 
 
@@ -669,6 +669,92 @@ async def show_main_menu(
 
 
 # ----------------------------------------------------------------------
+# Меню по статусу пользователя
+# ----------------------------------------------------------------------
+async def show_menu_by_role(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user: dict, text: str = None
+):
+    """
+    Отображает меню в зависимости от статуса пользователя и его ролей.
+    """
+    user_id = user["id"]
+    roles = User.get_roles(user_id)
+
+    keyboard = []
+
+    # Роли (админ/преподаватель) добавляются сверху, если есть
+    if "super_admin" in roles or "admin" in roles:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f527 Панель админа", callback_data="admin_panel"
+                )
+            ]
+        )
+    if "teacher" in roles:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f9d1\u200d\U0001f3eb Панель преподавателя",
+                    callback_data="teacher_panel",
+                )
+            ]
+        )
+
+    if user["status"] == "new":
+        # Гость — не заполнены контакты
+        keyboard.append(
+            [InlineKeyboardButton("\U0001f4c5 Расписание", callback_data="schedule")]
+        )
+        keyboard.append(
+            [InlineKeyboardButton("\U0001f9ed Направления", callback_data="directions")]
+        )
+        keyboard.append(
+            [InlineKeyboardButton("\u2139\ufe0f О студии", callback_data="info")]
+        )
+        keyboard.append(
+            [InlineKeyboardButton("\u270d\ufe0f Регистрация", callback_data="book")]
+        )
+    else:
+        # Ученик (active / expired / archived / inactive)
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f4c5 Расписание и запись", callback_data="schedule"
+                )
+            ]
+        )
+        keyboard.append(
+            [InlineKeyboardButton("\U0001f9ed Направления", callback_data="directions")]
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f4b0 Мой абонемент", callback_data="my_subscription"
+                )
+            ]
+        )
+        keyboard.append(
+            [InlineKeyboardButton("\U0001f464 Профиль", callback_data="profile")]
+        )
+        keyboard.append(
+            [InlineKeyboardButton("\u2139\ufe0f О студии", callback_data="info")]
+        )
+        keyboard.append(
+            [InlineKeyboardButton("\U0001f4ac Поддержка", callback_data="support")]
+        )
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if text is None:
+        text = "Выберите действие:"
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup)
+
+
 # Подменю "Направления"
 # ----------------------------------------------------------------------
 async def show_directions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -956,22 +1042,47 @@ async def show_pilates_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /start
 # ----------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+    """
+    /start — создаёт/возвращает пользователя в MySQL,
+    проверяет согласие, показывает меню по статусу.
+    """
+    tg_user = update.effective_user
     utm_source = context.args[0] if context.args else "direct"
 
-    # Сохраняем пользователя (utm_source обновится, имя/телефон не затронутся)
-    save_user(user.id, utm_source)
+    telegram_id = tg_user.id
+    username = tg_user.username
 
-    # Приветствие с учётом источника
-    welcome = f"Привет, {user.first_name}!"
+    # Создаём или получаем пользователя
+    user = User.create_or_get(telegram_id, username)
+
+    # Обновляем активность
+    User.update_activity(user["id"])
+
+    # --- Проверка согласия ---
+    if not user["consent_given"]:
+        welcome = (
+            f"\U0001f44b Привет, {tg_user.first_name}!\n\n"
+            "Для продолжения работы с ботом нам нужно ваше согласие "
+            "на обработку персональных данных.\n\n"
+            f"{CONSENT_TEXT}\n\n"
+            'Нажмите "\u2705 Согласен", чтобы продолжить.'
+        )
+        keyboard = [
+            [InlineKeyboardButton("\u2705 Согласен", callback_data="consent_agree")],
+        ]
+        await update.message.reply_text(
+            welcome, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    # --- Приветствие ---
+    welcome = f"\U0001f44b Привет, {tg_user.first_name}!"
     if utm_source == "bachata":
-        welcome += "\n\nРады видеть вас на странице Бачаты! 💃"
+        welcome += "\n\nРады видеть вас на странице Бачаты! \U0001f483"
     else:
-        welcome += "\n\nДобро пожаловать в нашу студию танцев и йоги! 🧘"
+        welcome += "\n\nДобро пожаловать в нашу студию танцев и йоги! \U0001f9d8"
 
-    await show_main_menu(
-        update, context, text=welcome + "\n\nВыберите действие в меню ниже:"
-    )
+    await show_menu_by_role(update, context, user, text=welcome)
 
 
 # ----------------------------------------------------------------------
@@ -1066,8 +1177,20 @@ async def book_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_name = context.user_data.get("full_name", "")
     telegram_id = update.effective_user.id
 
-    # Сохраняем в БД
-    update_user_details(telegram_id, full_name, phone)
+    # Получаем пользователя из MySQL
+    user = User.get_by_telegram_id(telegram_id)
+    if user:
+        # Сохраняем контакты
+        User.update_contacts(user["id"], full_name, phone)
+        # Меняем статус на active
+        User.set_status(user["id"], "active")
+        user_id = user["id"]
+    else:
+        # Если пользователя нет (редкий случай) — создаём
+        user = User.create_or_get(telegram_id, None)
+        User.update_contacts(user["id"], full_name, phone)
+        User.set_status(user["id"], "active")
+        user_id = user["id"]
 
     # Уведомление администратору
     if ADMIN_CHAT_ID:
@@ -1086,16 +1209,18 @@ async def book_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Не удалось отправить уведомление админу: {e}")
 
-    # Показываем подтверждение и возвращаем главное меню
+    # Показываем подтверждение и возвращаем меню по статусу
     await update.message.reply_text(
-        f"✅ Вы записаны!\n\n"
+        f"\u2705 Вы записаны!\n\n"
         f"Имя: {full_name}\n"
         f"Телефон: {phone}\n\n"
         "Мы свяжемся с вами в ближайшее время для подтверждения."
     )
     # Сбрасываем флаг диалога
     context.user_data["booking_active"] = False
-    await show_main_menu(update, context)
+    # Показываем меню ученика
+    user = User.get_by_telegram_id(telegram_id)
+    await show_menu_by_role(update, context, user)
     return ConversationHandler.END
 
 
@@ -1111,6 +1236,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Логируем все callback_data для отладки
     logger.info("Callback: %s", data)
+
+    # --- Согласие на обработку ПДн ---
+    if data == "consent_agree":
+        tg_user = update.effective_user
+        user = User.get_by_telegram_id(tg_user.id)
+        if user:
+            User.set_consent(user["id"], CONSENT_TEXT_VERSION)
+            logger.info(
+                "Пользователь %s дал согласие на ПДн (версия %s)",
+                user["id"],
+                CONSENT_TEXT_VERSION,
+            )
+            await show_menu_by_role(
+                update,
+                context,
+                user,
+                text="\u2705 Спасибо! Согласие зафиксировано. Выберите действие:",
+            )
+        else:
+            await query.edit_message_text(
+                "\u26a0\ufe0f Что-то пошло не так. Нажмите /start, чтобы продолжить."
+            )
+        return
 
     # --- Расписание: плоский показ на выбранный день ---
     if data == "schedule":
