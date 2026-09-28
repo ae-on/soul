@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS subscription_types (
     id                INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     name              VARCHAR(100) NOT NULL,
-    visits_count      INT UNSIGNED DEFAULT NULL COMMENT 'NULL — безлимит',
+    hours_count       DECIMAL(4,1) DEFAULT NULL COMMENT 'Часов в абонементе, NULL для безлимита',
     duration_days     INT UNSIGNED NOT NULL DEFAULT 30,
     price_byn         DECIMAL(8,2) NOT NULL,
     freeze_count_max  INT UNSIGNED NOT NULL DEFAULT 1,
@@ -58,8 +58,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     purchased_at    DATETIME NOT NULL COMMENT 'Дата покупки',
     started_at      DATETIME NOT NULL COMMENT 'Дата начала действия',
     expires_at      DATETIME DEFAULT NULL COMMENT 'Срок окончания (сдвигается при заморозке)',
-    visits_total    INT UNSIGNED DEFAULT NULL COMMENT 'NULL — безлимит',
-    visits_left     INT UNSIGNED DEFAULT NULL,
+    hours_total     DECIMAL(4,1) DEFAULT NULL COMMENT 'Всего часов, NULL для безлимита',
+    hours_left      DECIMAL(4,1) DEFAULT NULL COMMENT 'Остаток часов, NULL для безлимита',
     freeze_used     INT UNSIGNED NOT NULL DEFAULT 0,
     status          ENUM('active','frozen','expired','depleted') NOT NULL DEFAULT 'active',
     comment         TEXT DEFAULT NULL,
@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS bookings (
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     status          ENUM('registered','cancelled','attended','no_show','late_cancel') NOT NULL DEFAULT 'registered',
     cancelled_at    DATETIME DEFAULT NULL,
+    hours_charged   DECIMAL(4,1) DEFAULT NULL COMMENT 'Сколько часов списывается (1.0 или 1.5)',
 
     UNIQUE INDEX idx_user_event (user_id, em_event_id),
     INDEX idx_user_id (user_id),
@@ -146,6 +147,7 @@ CREATE TABLE IF NOT EXISTS visits (
     method          ENUM('qr','manual_teacher','manual_admin','self') NOT NULL DEFAULT 'qr',
     visit_type      ENUM('subscription','single','postpayment') NOT NULL DEFAULT 'subscription',
     status          ENUM('present','absent','cancelled') NOT NULL DEFAULT 'present',
+    hours_charged   DECIMAL(4,1) DEFAULT NULL COMMENT 'Сколько часов списано фактически',
     comment         TEXT DEFAULT NULL,
 
     INDEX idx_user_id (user_id),
