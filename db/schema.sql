@@ -122,9 +122,12 @@ CREATE TABLE IF NOT EXISTS bookings (
     user_id         INT UNSIGNED NOT NULL,
     em_event_id     BIGINT UNSIGNED NOT NULL,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    status          ENUM('registered','cancelled','attended','no_show','late_cancel') NOT NULL DEFAULT 'registered',
+    status          ENUM('registered','pending','confirmed','cancelled','late_cancel','attended','no_show','skipped') NOT NULL DEFAULT 'registered',
     cancelled_at    DATETIME DEFAULT NULL,
     hours_charged   DECIMAL(4,1) DEFAULT NULL COMMENT 'Сколько часов списывается (1.0 или 1.5)',
+    event_date      DATE DEFAULT NULL COMMENT 'Дата занятия из EM',
+    event_time      TIME DEFAULT NULL COMMENT 'Время начала занятия из EM',
+    refunded        TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'Были ли возвращены часы при отмене',
 
     UNIQUE INDEX idx_user_event (user_id, em_event_id),
     INDEX idx_user_id (user_id),

@@ -216,6 +216,81 @@ class SubscriptionType(BaseModel):
 class Subscription(BaseModel):
     TABLE = "subscriptions"
 
+    @classmethod
+    def get_active_for_user(cls, user_id: int) -> Optional[dict]:
+        """
+        Активный абонемент пользователя:
+        status='active', не истёк, есть часы (или безлимит).
+        Возвращает dict или None.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM subscriptions
+                       WHERE user_id = %s
+                         AND status = 'active'
+                         AND (expires_at IS NULL OR expires_at > NOW())
+                         AND (hours_left IS NULL OR hours_left > 0)
+                       ORDER BY created_at DESC
+                       LIMIT 1""",
+                    (user_id,),
+                )
+                return cur.fetchone()
+
+    @classmethod
+    def deduct_hours(cls, subscription_id: int, hours: float) -> bool:
+        """
+        Списать N часов с абонемента.
+        Проверяет, что hours_left >= hours.
+        Для безлимита (hours_left IS NULL) — всегда True.
+        """
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                # Проверяем остаток
+                cur.execute(
+                    "SELECT hours_left FROM subscriptions WHERE id = %s",
+                    (subscription_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False
+                if row["hours_left"] is None:
+                    # Безлимит — списываем без проверки
+                    return True
+                if row["hours_left"] < hours:
+                    return False
+                cur.execute(
+                    "UPDATE subscriptions SET hours_left = hours_left - %s WHERE id = %s",
+                    (hours, subscription_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+
+    @classmethod
+    def refund_hours(cls, subscription_id: int, hours: float) -> bool:
+        """
+        Вернуть N часов на абонемент (при отмене занятия).
+        Для безлимита (hours_total IS NULL) — ничего не делаем.
+        """
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT hours_total FROM subscriptions WHERE id = %s",
+                    (subscription_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False
+                if row["hours_total"] is None:
+                    # Безлимит — возвращать нечего
+                    return True
+                cur.execute(
+                    "UPDATE subscriptions SET hours_left = hours_left + %s WHERE id = %s",
+                    (hours, subscription_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+
 
 class Freeze(BaseModel):
     TABLE = "freezes"
@@ -227,6 +302,60 @@ class EventCache(BaseModel):
 
 class Booking(BaseModel):
     TABLE = "bookings"
+
+    @classmethod
+    def get_active_for_user(cls, user_id: int) -> list[dict]:
+        """Все активные записи пользователя (не cancelled/late_cancel/no_show)."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM bookings
+                       WHERE user_id = %s
+                         AND status IN ('registered', 'pending', 'confirmed')
+                       ORDER BY event_date, event_time""",
+                    (user_id,),
+                )
+                return cur.fetchall()
+
+    @classmethod
+    def get_by_user_and_event(cls, user_id: int, em_event_id: int) -> Optional[dict]:
+        """Найти запись конкретного пользователя на событие."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM bookings WHERE user_id = %s AND em_event_id = %s",
+                    (user_id, em_event_id),
+                )
+                return cur.fetchone()
+
+    @classmethod
+    def get_by_event(cls, em_event_id: int) -> list[dict]:
+        """Все записи на конкретное событие (для преподавателя)."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT b.*, u.full_name, u.phone, u.username
+                       FROM bookings b
+                       JOIN users u ON u.id = b.user_id
+                       WHERE b.em_event_id = %s
+                       ORDER BY b.created_at""",
+                    (em_event_id,),
+                )
+                return cur.fetchall()
+
+    @classmethod
+    def count_confirmed_for_event(cls, em_event_id: int) -> int:
+        """Количество записанных (для проверки лимита)."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) as cnt FROM bookings
+                       WHERE em_event_id = %s
+                         AND status IN ('registered', 'pending', 'confirmed')""",
+                    (em_event_id,),
+                )
+                row = cur.fetchone()
+                return row["cnt"] if row else 0
 
 
 class Visit(BaseModel):
