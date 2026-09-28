@@ -322,3 +322,89 @@ class UserRole(BaseModel):
                 )
                 conn.commit()
                 return cur.rowcount > 0
+
+
+class Group(BaseModel):
+    """Слоты (регулярные классы)."""
+
+    TABLE = "slots"
+
+    @classmethod
+    def get_active(cls) -> list[dict]:
+        """Все активные слоты."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM groups WHERE active = 1 ORDER BY category_slug, time_start"
+                )
+                return cur.fetchall()
+
+    @classmethod
+    def get_by_teacher(cls, teacher_id: int) -> list[dict]:
+        """Слоты конкретного преподавателя."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM groups WHERE teacher_id = %s AND active = 1 ORDER BY time_start",
+                    (teacher_id,),
+                )
+                return cur.fetchall()
+
+    @classmethod
+    def get_by_category(cls, category_slug: str) -> list[dict]:
+        """Слоты по дисциплине."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM groups WHERE category_slug = %s AND active = 1 ORDER BY time_start",
+                    (category_slug,),
+                )
+                return cur.fetchall()
+
+    @classmethod
+    def get_by_weekday(cls, weekday: int) -> list[dict]:
+        """
+        Слоты, которые идут в указанный день недели.
+        weekday: 1=Пн, 2=Вт, ..., 7=Вс.
+        Ищем вхождение числа в строку weekdays (например, "1,3").
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM groups
+                       WHERE active = 1
+                         AND FIND_IN_SET(%s, weekdays) > 0
+                       ORDER BY time_start""",
+                    (str(weekday),),
+                )
+                return cur.fetchall()
+
+    @staticmethod
+    def calculate_duration(time_start, time_end) -> float:
+        """Вычисляет длительность в часах (1.0 или 1.5)."""
+        from datetime import datetime, timedelta
+
+        # time_start/time_end могут быть timedelta или строкой
+        if isinstance(time_start, str):
+            ref = datetime.strptime("00:00:00", "%H:%M:%S")
+            start = datetime.strptime(str(time_start), "%H:%M:%S")
+            end = datetime.strptime(str(time_end), "%H:%M:%S")
+        else:
+            # timedelta
+            ref = datetime.min
+            start = ref + time_start
+            end = ref + time_end
+
+        diff = (end - start).total_seconds() / 3600
+        return round(diff, 1)
+
+    @classmethod
+    def create_with_duration(cls, **kwargs) -> int:
+        """
+        Создаёт слот, автоматически вычисляя duration_hours
+        из time_start и time_end.
+        """
+        time_start = kwargs.pop("time_start")
+        time_end = kwargs.pop("time_end")
+        kwargs["duration_hours"] = cls.calculate_duration(time_start, time_end)
+        return cls.create(**kwargs)
