@@ -3,6 +3,8 @@ import logging
 import os
 import warnings
 from datetime import date, datetime, timedelta
+from typing import Optional
+
 
 import aiohttp
 from dotenv import load_dotenv
