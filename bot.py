@@ -43,6 +43,15 @@ WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+async def safe_answer(query, text=None, show_alert=False):
+    """Безопасно отвечает на callback, игнорируя временные сетевые ошибки."""
+    try:
+        await query.answer(text=text, show_alert=show_alert)
+    except Exception as e:
+        logger.warning("Не удалось ответить на callback (%s): %s", type(e).__name__, e)
+
+
 # Состояния для диалога регистрации
 CONSENT, FULL_NAME, PHONE = range(3)
 
@@ -334,7 +343,7 @@ async def show_schedule_day(
     Если tag_slug задан — показывает только события с этим тегом.
     """
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     # Определяем выбранную дату
     if date_str:
@@ -535,7 +544,7 @@ async def book_event_stub(
 ):
     """Обработка нажатия «Записаться» на занятие — логика по статусу."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     telegram_id = update.effective_user.id
     user = User.get_by_telegram_id(telegram_id)
@@ -601,7 +610,7 @@ async def show_direction_schedule(
     Показывает расписание по направлению (slug) на ближайшие 7 дней.
     """
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     # Определяем meta по slug (обратный поиск)
     callback_key = None
@@ -811,7 +820,7 @@ async def show_menu_by_role(
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает профиль пользователя."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     telegram_id = update.effective_user.id
     user = User.get_by_telegram_id(telegram_id)
@@ -839,7 +848,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def confirm_delete_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Запрос подтверждения удаления данных."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     text = (
         "\u26a0\ufe0f Удалить ФИО и телефон?\n\n"
@@ -860,7 +869,7 @@ async def confirm_delete_data(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def profile_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Окончательное удаление данных пользователя."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     telegram_id = update.effective_user.id
     user = User.get_by_telegram_id(telegram_id)
@@ -893,14 +902,15 @@ async def profile_delete_confirm(update: Update, context: ContextTypes.DEFAULT_T
 async def show_directions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает подменю со всеми направлениями."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     keyboard = [
-        [InlineKeyboardButton("🔥 Трайбл фьюжн", callback_data="tribal_info")],
-        [InlineKeyboardButton("🩰 Восточный танец", callback_data="oriental_info")],
-        [InlineKeyboardButton("🧘 Йога", callback_data="yoga_info")],
-        [InlineKeyboardButton("💃 Бачата (для пар)", callback_data="bachata_info")],
-        [InlineKeyboardButton("🌿 Цигун", callback_data="qigong_info")],
+        [InlineKeyboardButton("\U0001f525 Трайбл фьюжн", callback_data="tribal_info")],
+        [InlineKeyboardButton("\U0001fa70 Восточный танец", callback_data="oriental_info")],
+        [InlineKeyboardButton("\U0001f9d8 Йога", callback_data="yoga_info")],
+        [InlineKeyboardButton("\U0001f483 Бачата (для пар)", callback_data="bachata_info")],
+        [InlineKeyboardButton("\U0001f33f Цигун", callback_data="qigong_info")],
+        [InlineKeyboardButton("\U0001f1ee\U0001f1f3 Индийский танец", callback_data="indian_info")],
         [InlineKeyboardButton("🇮🇳 Индийский танец", callback_data="indian_info")],
         [InlineKeyboardButton("🏛️ Исторический танец", callback_data="historical_info")],
         [InlineKeyboardButton("🧘 Пилатес", callback_data="pilates_info")],
@@ -919,7 +929,7 @@ async def show_directions_menu(update: Update, context: ContextTypes.DEFAULT_TYP
 # ----------------------------------------------------------------------
 async def show_tribal_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     keyboard = [
         [
@@ -949,7 +959,7 @@ async def show_tribal_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_oriental_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     keyboard = [
         [
@@ -978,7 +988,7 @@ async def show_oriental_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def show_yoga_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     keyboard = [
         [
@@ -1008,7 +1018,7 @@ async def show_yoga_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_bachata_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     keyboard = [
         [
@@ -1040,7 +1050,7 @@ async def show_bachata_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_qigong_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     keyboard = [
         [
@@ -1071,7 +1081,7 @@ async def show_qigong_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_indian_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     keyboard = [
         [
@@ -1103,7 +1113,7 @@ async def show_indian_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_historical_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     keyboard = [
         [
@@ -1137,7 +1147,7 @@ async def show_historical_info(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def show_pilates_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     keyboard = [
         [
@@ -1264,7 +1274,7 @@ async def book_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Шаг 1 регистрации — показать согласие на ПДн.
     """
     context.user_data["booking_active"] = True
-    await update.callback_query.answer()
+    await safe_answer(update.callback_query)
 
     text = (
         "\u270d\ufe0f Регистрация в студии Soul\n\n"
@@ -1289,7 +1299,7 @@ async def book_consent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Вызывается внутри ConversationHandler.
     """
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     telegram_id = update.effective_user.id
     user = User.get_by_telegram_id(telegram_id)
@@ -1378,12 +1388,329 @@ async def book_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------------------------------------------------
+# Админ-панель
+# ----------------------------------------------------------------------
+
+
+async def _require_admin(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> Optional[dict]:
+    """
+    Проверяет, что пользователь — admin или super_admin.
+    Возвращает dict пользователя или None (и показывает alert).
+    """
+    query = update.callback_query
+    user = User.get_by_telegram_id(update.effective_user.id)
+    if not user:
+        await safe_answer(query, "Не зарегистрирован", show_alert=True)
+        return None
+    roles = UserRole.get_active_roles(user["id"])
+    if "admin" not in roles and "super_admin" not in roles:
+        await safe_answer(query, "Нет доступа", show_alert=True)
+        return None
+    return user
+
+
+async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главное меню админ-панели."""
+    user = await _require_admin(update, context)
+    if not user:
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("\U0001f465 Пользователи", callback_data="admin_users")],
+        [InlineKeyboardButton("\U0001f3ab Роли", callback_data="admin_roles")],
+        [InlineKeyboardButton("\U0001f3e0 Главное меню", callback_data="back_to_main")],
+    ]
+    text = "\U0001f527 Панель администратора"
+    await update.callback_query.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def show_admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сводка по пользователям."""
+    user = await _require_admin(update, context)
+    if not user:
+        return
+
+    counts = User.count_by_status()
+    text = (
+        "\U0001f465 Пользователи\n\n"
+        f"\U0001f195 Новые (без регистрации): {counts.get('new', 0)}\n"
+        f"\u2705 Активные: {counts.get('active', 0)}\n"
+        f"\u23f3 Истёкшие: {counts.get('expired', 0)}\n"
+        f"\U0001f4e6 Всего: {counts.get('total', 0)}"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\U0001f195 Новые", callback_data="admin_users_new"
+            ),
+            InlineKeyboardButton(
+                "\u2705 Активные", callback_data="admin_users_active"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f4e6 Все", callback_data="admin_users_all"
+            )
+        ],
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_panel")],
+    ]
+    await update.callback_query.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def show_admin_users_list(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, status_filter: str = None
+):
+    """Список пользователей по фильтру статуса."""
+    user = await _require_admin(update, context)
+    if not user:
+        return
+
+    status_labels = {
+        "new": "\U0001f195 Новые (зарегистрировались в боте, но не прошли регистрацию)",
+        "active": "\u2705 Активные (прошли регистрацию)",
+    }
+    if status_filter:
+        title = status_labels.get(status_filter, f"Статус: {status_filter}")
+    else:
+        title = "\U0001f4e6 Все пользователи"
+
+    users = User.list_by_status(status_filter=status_filter, limit=20)
+
+    if not users:
+        text = f"{title}\n\nНет пользователей."
+    else:
+        lines = [title, ""]
+        for i, u in enumerate(users, 1):
+            username = f"@{u['username']}" if u.get("username") else "—"
+            reg_date = u["registered_at"]
+            if reg_date:
+                reg_date = reg_date.strftime("%d.%m.%Y") if hasattr(reg_date, "strftime") else str(reg_date)[:10]
+            else:
+                reg_date = "—"
+            lines.append(
+                f"{i}. {u['full_name'] or '—'} — {username}\n"
+                f"   Статус: {u['status']}, зашёл: {reg_date}"
+            )
+        text = "\n".join(lines)
+
+    # Кнопка «Карточка» для каждого пользователя
+    keyboard = []
+    for u in users[:20]:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"\U0001f464 {u['full_name'] or u['username'] or u['id']}",
+                    callback_data=f"admin_user_{u['id']}",
+                )
+            ]
+        )
+
+    # Кнопка назад — к сводке пользователей
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_users")]
+    )
+    await update.callback_query.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def show_admin_user_card(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """Карточка пользователя."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+
+    u = User.get_by_id(user_id)
+    if not u:
+        await safe_answer(
+            update.callback_query, "Пользователь не найден", show_alert=True
+        )
+        return
+
+    roles = UserRole.get_active_roles(user_id)
+    roles_str = ", ".join(roles) if roles else "—"
+    consent = (
+        f"да (v{u.get('consent_text_version', '—')})"
+        if u.get("consent_given")
+        else "нет"
+    )
+    reg_date = u.get("registered_at")
+    if reg_date:
+        reg_date = reg_date.strftime("%d.%m.%Y") if hasattr(reg_date, "strftime") else str(reg_date)[:10]
+    else:
+        reg_date = "—"
+
+    text = (
+        f"\U0001f464 {u['full_name'] or '—'}\n"
+        f"ID в БД: {u['id']}\n"
+        f"Telegram ID: {u['telegram_id']}\n"
+        f"Username: @{u['username'] or '—'}\n"
+        f"Телефон: {u['phone'] or '—'}\n"
+        f"Статус: {u['status']}\n"
+        f"Роли: {roles_str}\n"
+        f"Согласие на ПДн: {consent}\n"
+        f"Зарегистрирован: {reg_date}"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\U0001f3ab Роли", callback_data=f"admin_user_roles_{user_id}"
+            ),
+            InlineKeyboardButton(
+                "\U0001f4b0 Абонементы", callback_data=f"admin_user_subs_{user_id}"
+            ),
+        ],
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_users")],
+    ]
+    await update.callback_query.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def show_admin_roles(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список последних пользователей для управления ролями."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+
+    users = User.list_by_status(limit=20)
+
+    if not users:
+        text = "\U0001f3ab Управление ролями\n\nНет пользователей."
+    else:
+        lines = ["\U0001f3ab Управление ролями", "Последние 20 пользователей:", ""]
+        for u in users:
+            username = f"@{u['username']}" if u.get("username") else "—"
+            lines.append(
+                f"[{u['id']}] {u['full_name'] or '—'} — {username}"
+            )
+        text = "\n".join(lines)
+
+    keyboard = []
+    for u in users[:20]:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"\U0001f464 {u['full_name'] or u['username'] or u['id']}",
+                    callback_data=f"admin_user_roles_{u['id']}",
+                )
+            ]
+        )
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_panel")]
+    )
+    await update.callback_query.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def show_admin_user_roles(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """Управление ролями конкретного пользователя."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+
+    u = User.get_by_id(user_id)
+    if not u:
+        await safe_answer(
+            update.callback_query, "Пользователь не найден", show_alert=True
+        )
+        return
+
+    active_roles = UserRole.get_active_roles(user_id)
+    all_role_names = ["student", "teacher", "admin"]
+
+    # Строим список текущих ролей
+    current_lines = []
+    for role in all_role_names:
+        if role in active_roles:
+            current_lines.append(f"\u2705 {role}")
+        else:
+            current_lines.append(f"\u274c {role}")
+
+    text = (
+        f"\U0001f3ab Роли: {u['full_name'] or u['username'] or u['id']}\n\n"
+        "Текущие:\n" + "\n".join(current_lines)
+    )
+
+    keyboard = []
+    # Кнопки назначения ролей (кроме student — выдаётся автоматически)
+    for role in ["teacher", "admin"]:
+        if role not in active_roles:
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"\u2795 {role}",
+                        callback_data=f"admin_role_grant_{role}_{user_id}",
+                    )
+                ]
+            )
+        else:
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"\u274c Снять {role}",
+                        callback_data=f"admin_role_revoke_{role}_{user_id}",
+                    )
+                ]
+            )
+
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_roles")]
+    )
+    await update.callback_query.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def show_admin_role_grant(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, role: str, user_id: int
+):
+    """Выдать роль пользователю."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+
+    UserRole.grant(user_id, role, granted_by=admin["id"])
+    logger.info(
+        "Админ %s выдал роль %s пользователю %s", admin["id"], role, user_id
+    )
+    await show_admin_user_roles(update, context, user_id)
+
+
+async def show_admin_role_revoke(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, role: str, user_id: int
+):
+    """Снять роль у пользователя."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+
+    UserRole.revoke(user_id, role)
+    logger.info(
+        "Админ %s снял роль %s у пользователя %s", admin["id"], role, user_id
+    )
+    await show_admin_user_roles(update, context, user_id)
+
+
+# ----------------------------------------------------------------------
 # Обработчик инлайн-кнопок (все, кроме book, который перехватывается
 # ConversationHandler)
 # ----------------------------------------------------------------------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     data = query.data
 
@@ -1500,6 +1827,75 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await show_info_menu(update, context)
         return
+
+    # --- Админ-панель ---
+    if data == "admin_panel":
+        await show_admin_panel(update, context)
+        return
+
+    if data == "admin_users":
+        await show_admin_users(update, context)
+        return
+
+    if data == "admin_users_new":
+        await show_admin_users_list(update, context, status_filter="new")
+        return
+
+    if data == "admin_users_active":
+        await show_admin_users_list(update, context, status_filter="active")
+        return
+
+    if data == "admin_users_all":
+        await show_admin_users_list(update, context)
+        return
+
+    if data == "admin_roles":
+        await show_admin_roles(update, context)
+        return
+
+    # Управление ролями пользователя — проверяем ДО admin_user_
+    if data.startswith("admin_user_roles_"):
+        try:
+            uid = int(data[len("admin_user_roles_"):])
+            await show_admin_user_roles(update, context, uid)
+            return
+        except (ValueError, IndexError):
+            pass
+
+    # Карточка пользователя
+    if data.startswith("admin_user_"):
+        try:
+            uid = int(data[len("admin_user_"):])
+            await show_admin_user_card(update, context, uid)
+            return
+        except ValueError:
+            pass
+
+    # Выдать роль
+    if data.startswith("admin_role_grant_"):
+        # Формат: admin_role_grant_{role}_{user_id}
+        parts = data.split("_")
+        # parts = ['admin', 'role', 'grant', 'teacher', '42']
+        if len(parts) >= 5:
+            role = parts[3]
+            try:
+                uid = int(parts[4])
+                await show_admin_role_grant(update, context, role, uid)
+                return
+            except ValueError:
+                pass
+
+    # Снять роль
+    if data.startswith("admin_role_revoke_"):
+        parts = data.split("_")
+        if len(parts) >= 5:
+            role = parts[3]
+            try:
+                uid = int(parts[4])
+                await show_admin_role_revoke(update, context, role, uid)
+                return
+            except ValueError:
+                pass
 
     # --- Остальные пункты ---
     if data == "prices":

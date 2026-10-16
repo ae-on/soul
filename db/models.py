@@ -208,6 +208,52 @@ class User(BaseModel):
                 conn.commit()
                 return cur.rowcount > 0
 
+    @classmethod
+    def list_by_status(
+        cls, status_filter: str = None, limit: int = 20, offset: int = 0
+    ) -> list[dict]:
+        """
+        Список пользователей с фильтром по статусу,
+        сортировка по registered_at DESC.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                if status_filter:
+                    cur.execute(
+                        """SELECT * FROM users
+                           WHERE status = %s
+                           ORDER BY registered_at DESC
+                           LIMIT %s OFFSET %s""",
+                        (status_filter, limit, offset),
+                    )
+                else:
+                    cur.execute(
+                        """SELECT * FROM users
+                           WHERE status IN ('new', 'active', 'expired', 'archived')
+                           ORDER BY registered_at DESC
+                           LIMIT %s OFFSET %s""",
+                        (limit, offset),
+                    )
+                return cur.fetchall()
+
+    @classmethod
+    def count_by_status(cls) -> dict:
+        """
+        Возвращает словарь с количеством пользователей по статусам.
+        Ключи: new, active, expired, total.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT status, COUNT(*) as cnt FROM users
+                       WHERE status IN ('new', 'active', 'expired', 'archived')
+                       GROUP BY status"""
+                )
+                counts = {row["status"]: row["cnt"] for row in cur.fetchall()}
+                cur.execute("SELECT COUNT(*) as total FROM users")
+                counts["total"] = cur.fetchone()["total"]
+                return counts
+
 
 class SubscriptionType(BaseModel):
     TABLE = "subscription_types"

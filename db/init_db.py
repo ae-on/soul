@@ -23,13 +23,13 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 # Начальные данные для subscription_types
 INITIAL_SUBSCRIPTION_TYPES = [
-    (1, "Разовое", 1, 1, 25.00, 0, 0, 1, 1, 1),
-    (2, "Разовое 1.5ч", 1, 1, 30.00, 0, 0, 1, 1, 2),
-    (3, "4 занятия", 4, 30, 90.00, 1, 14, 1, 1, 3),
-    (4, "4 занятия 1.5ч", 4, 30, 110.00, 1, 14, 1, 1, 4),
-    (5, "8 занятий", 8, 30, 145.00, 1, 14, 1, 1, 5),
-    (6, "8 занятий 1.5ч", 8, 30, 185.00, 1, 14, 1, 1, 6),
-    (7, "12 занятий", 12, 30, 200.00, 1, 14, 1, 1, 7),
+    (1, "Разовое", 1.0, 1, 25.00, 0, 0, 1, 1, 1),
+    (2, "Разовое 1.5ч", 1.5, 1, 30.00, 0, 0, 1, 1, 2),
+    (3, "4 занятия", 4.0, 30, 90.00, 1, 14, 1, 1, 3),
+    (4, "4 занятия 1.5ч", 6.0, 30, 110.00, 1, 14, 1, 1, 4),
+    (5, "8 занятий", 8.0, 30, 145.00, 1, 14, 1, 1, 5),
+    (6, "8 занятий 1.5ч", 12.0, 30, 185.00, 1, 14, 1, 1, 6),
+    (7, "12 занятий", 12.0, 30, 200.00, 1, 14, 1, 1, 7),
     (8, "Безлимит 30 дней", None, 30, 250.00, 1, 14, 1, 1, 8),
 ]
 
@@ -93,11 +93,21 @@ def init_database():
                 try:
                     cur.execute(
                         """
-                        INSERT IGNORE INTO subscription_types
-                            (id, name, visits_count, duration_days, price_byn,
+                        INSERT INTO subscription_types
+                            (id, name, hours_count, duration_days, price_byn,
                              freeze_count_max, freeze_days_max, cross_group,
                              active, sort_order)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            name = VALUES(name),
+                            hours_count = VALUES(hours_count),
+                            duration_days = VALUES(duration_days),
+                            price_byn = VALUES(price_byn),
+                            freeze_count_max = VALUES(freeze_count_max),
+                            freeze_days_max = VALUES(freeze_days_max),
+                            cross_group = VALUES(cross_group),
+                            active = VALUES(active),
+                            sort_order = VALUES(sort_order)
                         """,
                         row,
                     )
