@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import math
 import os
+import re
 import warnings
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -30,7 +32,14 @@ warnings.filterwarnings(
 
 from db.connection import get_connection
 from db.constants import CONSENT_TEXT, CONSENT_TEXT_VERSION
-from db.models import User, UserRole
+from db.models import (
+    Freeze,
+    Subscription,
+    SubscriptionType,
+    User,
+    UserRole,
+    Visit,
+)
 from rag_agent import ask, sync_knowledge
 
 load_dotenv()
@@ -54,8 +63,33 @@ async def safe_answer(query, text=None, show_alert=False):
         logger.warning("Не удалось ответить на callback (%s): %s", type(e).__name__, e)
 
 
+def _format_date(value) -> str:
+    """Форматирует дату как ДД.ММ.ГГГГ; None превращает в «—»."""
+    if value is None:
+        return "—"
+    if hasattr(value, "strftime"):
+        return value.strftime("%d.%m.%Y")
+    return str(value)[:10]
+
+
+async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    """Отправляет уведомление администратору (ADMIN_CHAT_ID из .env)."""
+    if not ADMIN_CHAT_ID:
+        logger.info("ADMIN_CHAT_ID не задан — уведомление не отправлено")
+        return False
+    try:
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+        return True
+    except Exception as e:
+        logger.error("Не удалось отправить уведомление админу: %s", e)
+        return False
+
+
 # Состояния для диалога регистрации
 CONSENT, FULL_NAME, PHONE = range(3)
+
+# Состояния для диалога редактирования профиля
+PROFILE_FULL_NAME, PROFILE_PHONE = range(2)
 
 # Инициализируем FTS5 (база знаний) при старте
 sync_knowledge()
@@ -820,31 +854,51 @@ async def show_menu_by_role(
 # Профиль пользователя
 # ----------------------------------------------------------------------
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает профиль пользователя."""
+    """Показывает профиль пользователя (работает и от кнопки, и из диалога)."""
     query = update.callback_query
-    await safe_answer(query)
+    if query:
+        await safe_answer(query)
 
     telegram_id = update.effective_user.id
     user = User.get_by_telegram_id(telegram_id)
     if not user:
-        await query.edit_message_text("Ошибка загрузки профиля. Нажмите /start.")
+        if query:
+            await query.edit_message_text("Ошибка загрузки профиля. Нажмите /start.")
+        else:
+            await update.message.reply_text("Ошибка загрузки профиля. Нажмите /start.")
         return
 
+    # Поля могут быть пустыми строками '' — трактуем как «не указано»
+    full_name = user.get("full_name") or ""
+    phone = user.get("phone") or ""
+
+    roles = UserRole.get_active_roles(user["id"])
+    roles_str = ", ".join(roles) if roles else "—"
+
     text = (
-        f"\U0001f464 Профиль\n\n"
-        f"Имя: {user.get('full_name') or '—'}\n"
-        f"Телефон: {user.get('phone') or '—'}\n"
+        "\U0001f464 Профиль\n\n"
+        f"ФИО: {full_name or 'не указано'}\n"
+        f"Телефон: {phone or 'не указан'}\n"
+        f"Telegram: @{user.get('username') or user.get('telegram_id')}\n"
         f"Статус: {user.get('status')}\n"
+        f"Роли: {roles_str}\n"
+        f"Зарегистрирован: {_format_date(user.get('registered_at'))}"
     )
     keyboard = [
+        [InlineKeyboardButton("\u270f\ufe0f Изменить данные", callback_data="profile_edit")],
         [
             InlineKeyboardButton(
                 "\U0001f5d1\ufe0f Удалить данные", callback_data="confirm_delete"
             )
         ],
-        [InlineKeyboardButton("\U0001f519 Назад", callback_data="back_to_main")],
+        [InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")],
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup)
 
 
 async def confirm_delete_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -897,6 +951,396 @@ async def profile_delete_confirm(update: Update, context: ContextTypes.DEFAULT_T
         "Вы можете зарегистрироваться снова через меню."
     )
     await show_info_menu(update, context)
+
+
+RULES_URL = "https://soul.by/ceni-na-tanci-minsk/"
+
+
+# ----------------------------------------------------------------------
+# Абонемент пользователя
+# ----------------------------------------------------------------------
+async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает информацию об абонементе пользователя."""
+    query = update.callback_query
+    await safe_answer(query)
+
+    telegram_id = update.effective_user.id
+    user = User.get_by_telegram_id(telegram_id)
+    if not user:
+        await query.edit_message_text("Ошибка загрузки. Нажмите /start.")
+        return
+
+    sub = Subscription.get_active_for_user(user["id"])
+
+    # --- Нет активного абонемента ---
+    if not sub:
+        text = "\U0001f4b0 Абонемент\n\nУ вас нет активного абонемента."
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "\U0001f3e2 Купить в студии", callback_data="sub_buy_offline"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "\U0001f6d2 Купить онлайн (ЕРИП)", callback_data="sub_buy_online"
+                )
+            ],
+            [InlineKeyboardButton("\U0001f4d6 Правила пользования", url=RULES_URL)],
+            [InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # --- Есть активный абонемент ---
+    sub_type = SubscriptionType.get_by_id(sub["type_id"]) if sub.get("type_id") else None
+    type_name = sub_type["name"] if sub_type else "Абонемент"
+
+    hours_left = sub.get("hours_left")
+    lines = [
+        "\U0001f4b0 Мой абонемент",
+        "",
+        f"\U0001f4ca {type_name}",
+    ]
+    if hours_left is None:
+        # Безлимит
+        lines.append("\u23f3 Безлимит")
+    else:
+        n_one = math.floor(hours_left / 1.0)
+        n_half = math.floor(hours_left / 1.5)
+        lines.append(f"Осталось: {hours_left} часов")
+        lines.append(f"≈ {n_one} занятий по 1ч или {n_half} по 1.5ч")
+
+    expires_at = sub.get("expires_at")
+    if expires_at:
+        days_left = (expires_at.date() - date.today()).days
+        lines.append(
+            f"Действует до: {_format_date(expires_at)} ({days_left} дней)"
+        )
+    else:
+        lines.append("Действует до: без ограничений")
+
+    freeze_used = sub.get("freeze_used") or 0
+    freeze_count_max = sub_type["freeze_count_max"] if sub_type else 0
+    lines.append(
+        f"Использовано заморозок: {freeze_used} из {freeze_count_max}"
+    )
+    text = "\n".join(lines)
+
+    keyboard = [
+        [InlineKeyboardButton("\U0001f4c5 История посещений", callback_data="sub_history")],
+        [InlineKeyboardButton("\U0001f9ca Заморозить", callback_data="sub_freeze")],
+        [
+            InlineKeyboardButton(
+                "\U0001f3e2 Продлить в студии", callback_data="sub_buy_offline"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f6d2 Продлить онлайн (ЕРИП)", callback_data="sub_buy_online"
+            )
+        ],
+        [InlineKeyboardButton("\U0001f4d6 Правила пользования", url=RULES_URL)],
+    ]
+
+    # Активная заморозка — дополнительный блок и кнопка отмены
+    freeze = Freeze.get_active_for_subscription(sub["id"])
+    if freeze:
+        freeze_days_left = (freeze["end_date"] - date.today()).days
+        text += (
+            "\n\n\U0001f9ca Активная заморозка: "
+            f"с {_format_date(freeze['start_date'])} "
+            f"по {_format_date(freeze['end_date'])}\n"
+            f"(осталось {freeze_days_left} дней)"
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\u274c Отменить заморозку", callback_data="sub_freeze_cancel"
+                )
+            ]
+        )
+
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")]
+    )
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_subscription_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """История посещений пользователя (последние 20)."""
+    query = update.callback_query
+    await safe_answer(query)
+
+    telegram_id = update.effective_user.id
+    user = User.get_by_telegram_id(telegram_id)
+    if not user:
+        await query.edit_message_text("Ошибка загрузки. Нажмите /start.")
+        return
+
+    visits = Visit.get_by_user(user["id"], limit=20)
+
+    if not visits:
+        text = "\U0001f4c5 История посещений\n\nПока нет посещений."
+    else:
+        lines = ["\U0001f4c5 История посещений (последние 20)", ""]
+        for v in visits:
+            visit_status = (v.get("status") or "").lower()
+            event_name = v.get("event_name") or f"Событие #{v.get('em_event_id')}"
+            event_date = _format_date(v.get("event_date") or v.get("marked_at"))
+            hours = v.get("hours_charged")
+            hours_str = f"{hours}ч" if hours is not None else "—"
+
+            if visit_status in ("present", "attended", "registered"):
+                icon = "\u2705"
+                line = f"{event_date} · {event_name} · {hours_str}"
+            elif visit_status == "cancelled":
+                icon = "\u274c"
+                line = f"{event_date} · {event_name} · отменено"
+            else:
+                # absent / no_show / late_cancel / skipped
+                icon = "\u26a0\ufe0f"
+                line = f"{event_date} · {event_name} · пропуск"
+            lines.append(f"{icon} {line}")
+        text = "\n".join(lines)
+
+    keyboard = [
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="my_subscription")]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ----------------------------------------------------------------------
+# Заглушки: заморозка, продление, покупка (полная логика — позже)
+# ----------------------------------------------------------------------
+async def show_sub_freeze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Заморозка абонемента — заглушка."""
+    query = update.callback_query
+    await safe_answer(query)
+    text = "\U0001f9ca Заморозка будет доступна в ближайшее время."
+    keyboard = [[InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_sub_buy_offline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Заявка на покупку (или продление) абонемента в студии."""
+    query = update.callback_query
+    await safe_answer(query)
+
+    telegram_id = update.effective_user.id
+    user = User.get_by_telegram_id(telegram_id)
+
+    # Определяем: продление текущего абонемента или покупка нового
+    purchase_text = "Новый абонемент"
+    if user:
+        sub = Subscription.get_active_for_user(user["id"])
+        if sub:
+            sub_type = (
+                SubscriptionType.get_by_id(sub["type_id"])
+                if sub.get("type_id")
+                else None
+            )
+            purchase_text = (
+                f"Продление: {sub_type['name'] if sub_type else 'текущий абонемент'}"
+            )
+
+    # Уведомление администратору
+    if user:
+        admin_msg = (
+            "\U0001f3e2 Заявка на покупку абонемента\n\n"
+            f"Клиент: {user.get('full_name') or '—'} (ID {telegram_id})\n"
+            f"Телефон: {user.get('phone') or '—'}\n"
+            f"Абонемент: {purchase_text}\n\n"
+            "Свяжитесь для оформления (нал/безнал)."
+        )
+        await notify_admin(context, admin_msg)
+        logger.info("Заявка на покупку абонемента от пользователя %s", user["id"])
+
+    text = (
+        "\u2705 Заявка отправлена.\n\n"
+        "Администратор свяжется с вами для оформления "
+        "и уточнения оплаты."
+    )
+    keyboard = [[InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_sub_buy_online(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Онлайн-оплата через ЕРИП — заглушка (интеграция позже)."""
+    query = update.callback_query
+    await safe_answer(query)
+
+    text = (
+        "\U0001f6d2 Онлайн-оплата временно недоступна.\n\n"
+        "Скоро добавим оплату через ЕРИП. А пока — "
+        "оформите покупку в студии."
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\U0001f3e2 Купить в студии", callback_data="sub_buy_offline"
+            )
+        ],
+        [InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_sub_freeze_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена активной заморозки клиентом."""
+    query = update.callback_query
+    await safe_answer(query)
+
+    telegram_id = update.effective_user.id
+    user = User.get_by_telegram_id(telegram_id)
+    if not user:
+        await query.edit_message_text("Ошибка загрузки. Нажмите /start.")
+        return
+
+    sub = Subscription.get_active_for_user(user["id"])
+    if not sub:
+        text = "Активный абонемент не найден."
+    else:
+        freeze = Freeze.get_active_for_subscription(sub["id"])
+        if not freeze:
+            text = "У вас нет активной заморозки."
+        else:
+            Freeze.cancel(freeze["id"])
+            logger.info(
+                "Пользователь %s отменил заморозку %s", user["id"], freeze["id"]
+            )
+            text = "\u274c Заморозка отменена."
+
+    keyboard = [[InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ----------------------------------------------------------------------
+# Редактирование профиля (ConversationHandler)
+# ----------------------------------------------------------------------
+async def profile_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1 — показываем текущие данные, просим новое ФИО."""
+    query = update.callback_query
+    await safe_answer(query)
+
+    telegram_id = update.effective_user.id
+    user = User.get_by_telegram_id(telegram_id)
+    if not user:
+        await query.edit_message_text("Ошибка. Нажмите /start.")
+        return ConversationHandler.END
+
+    context.user_data["profile_edit_user_id"] = user["id"]
+    context.user_data["profile_edit_old"] = {
+        "full_name": user.get("full_name") or "",
+        "phone": user.get("phone") or "",
+    }
+
+    text = (
+        "\u270f\ufe0f Изменение данных\n\n"
+        f"Текущее ФИО: {user.get('full_name') or 'не указано'}\n"
+        f"Текущий телефон: {user.get('phone') or 'не указан'}\n\n"
+        "Введите новое ФИО (или «-» чтобы оставить):"
+    )
+    keyboard = [[InlineKeyboardButton("\U0001f519 Отмена", callback_data="profile_cancel")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return PROFILE_FULL_NAME
+
+
+async def profile_edit_full_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2 — сохраняем ФИО, запрашиваем телефон."""
+    new_name = update.message.text.strip()
+
+    if new_name != "-":
+        if len(new_name) < 3:
+            await update.message.reply_text(
+                "\u26a0\ufe0f ФИО должно содержать минимум 3 символа. "
+                "Попробуйте ещё раз (или «-» чтобы оставить текущее):"
+            )
+            return PROFILE_FULL_NAME
+        context.user_data["profile_edit_new_name"] = new_name
+    else:
+        context.user_data["profile_edit_new_name"] = None
+
+    await update.message.reply_text(
+        "Введите новый телефон (или «-» чтобы оставить без изменений):"
+    )
+    return PROFILE_PHONE
+
+
+async def profile_edit_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 3 — валидация телефона, сохранение, уведомление админу."""
+    new_phone = update.message.text.strip()
+
+    if new_phone != "-":
+        digits = re.sub(r"\D", "", new_phone)
+        if len(digits) < 7:
+            await update.message.reply_text(
+                "\u26a0\ufe0f В телефоне должно быть минимум 7 цифр "
+                "(можно с + и пробелами). Попробуйте ещё раз "
+                "(или «-» чтобы оставить текущий):"
+            )
+            return PROFILE_PHONE
+        context.user_data["profile_edit_new_phone"] = new_phone
+    else:
+        context.user_data["profile_edit_new_phone"] = None
+
+    user_id = context.user_data.get("profile_edit_user_id")
+    old = context.user_data.get("profile_edit_old", {})
+    old_name = old.get("full_name") or ""
+    old_phone = old.get("phone") or ""
+
+    # «-» означает «оставить текущее значение»
+    new_name = context.user_data.get("profile_edit_new_name") or old_name
+    new_phone_val = context.user_data.get("profile_edit_new_phone") or old_phone
+
+    User.update_contacts(user_id, new_name, new_phone_val)
+    logger.info(
+        "Пользователь %s обновил профиль: %s -> %s, %s -> %s",
+        user_id,
+        old_name,
+        new_name,
+        old_phone,
+        new_phone_val,
+    )
+
+    # Уведомление админу о смене данных
+    telegram_id = update.effective_user.id
+    admin_msg = (
+        "\u270f\ufe0f Смена данных профиля\n\n"
+        f"Клиент: {old_name or '—'} (ID {telegram_id})\n"
+        f"Было: {old_name or '—'}, {old_phone or '—'}\n"
+        f"Стало: {new_name or '—'}, {new_phone_val or '—'}"
+    )
+    await notify_admin(context, admin_msg)
+
+    await update.message.reply_text("\u2705 Данные обновлены.")
+    # Возвращаем экран профиля
+    await show_profile(update, context)
+    return ConversationHandler.END
+
+
+async def profile_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена редактирования профиля (кнопка profile_cancel или /cancel)."""
+    # Очищаем временные данные диалога
+    for key in list(context.user_data):
+        if key.startswith("profile_edit_"):
+            context.user_data.pop(key, None)
+
+    if update.callback_query:
+        await safe_answer(update.callback_query)
+        await update.callback_query.edit_message_text(
+            "\u270f\ufe0f Изменение данных отменено."
+        )
+    else:
+        await update.message.reply_text("\u270f\ufe0f Изменение данных отменено.")
+
+    # Показываем профиль (или меню, если нет пользователя)
+    user = User.get_by_telegram_id(update.effective_user.id)
+    if user:
+        await show_profile(update, context)
+    else:
+        await show_info_menu(update, context)
+    return ConversationHandler.END
 
 
 # Подменю "Направления"
@@ -1830,6 +2274,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_info_menu(update, context)
         return
 
+    # --- Абонемент ---
+    if data == "my_subscription":
+        await show_my_subscription(update, context)
+        return
+
+    if data == "sub_history":
+        await show_subscription_history(update, context)
+        return
+
+    if data == "sub_freeze":
+        await show_sub_freeze(update, context)
+        return
+
+    if data == "sub_buy_offline":
+        await show_sub_buy_offline(update, context)
+        return
+
+    if data == "sub_buy_online":
+        await show_sub_buy_online(update, context)
+        return
+
+    if data == "sub_freeze_cancel":
+        await show_sub_freeze_cancel(update, context)
+        return
+
     # --- Админ-панель ---
     if data == "admin_panel":
         await show_admin_panel(update, context)
@@ -1963,6 +2432,22 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    # ConversationHandler для редактирования профиля
+    profile_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(profile_edit_start, pattern="^profile_edit$")],
+        states={
+            PROFILE_FULL_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, profile_edit_full_name),
+                CallbackQueryHandler(profile_cancel, pattern="^profile_cancel$"),
+            ],
+            PROFILE_PHONE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, profile_edit_phone),
+                CallbackQueryHandler(profile_cancel, pattern="^profile_cancel$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", profile_cancel)],
+    )
+
     # -----------------------------------------------------------------------
     # Error handler — логирует необработанные исключения
     # -----------------------------------------------------------------------
@@ -1979,6 +2464,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("ask", ask_handler))
     application.add_handler(book_conv)
+    application.add_handler(profile_conv)
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
     )
