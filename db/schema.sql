@@ -86,10 +86,16 @@ CREATE TABLE IF NOT EXISTS freezes (
     reason            VARCHAR(255) DEFAULT NULL COMMENT 'болезнь, отпуск, другое',
     created_by        INT UNSIGNED DEFAULT NULL COMMENT 'Кто оформил (users.id)',
     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status            ENUM('pending','approved','rejected','cancelled','completed') NOT NULL DEFAULT 'approved' COMMENT 'Статус заявки на заморозку',
+    reviewed_by       INT UNSIGNED DEFAULT NULL COMMENT 'Кто рассмотрел (users.id)',
+    reviewed_at       DATETIME DEFAULT NULL COMMENT 'Когда рассмотрено',
+    actual_end_date   DATE DEFAULT NULL COMMENT 'Фактическая дата окончания заморозки',
+    days_actual       INT DEFAULT NULL COMMENT 'Фактическое количество дней заморозки',
 
     INDEX idx_subscription_id (subscription_id),
     INDEX idx_start_date (start_date),
     INDEX idx_end_date (end_date),
+    INDEX idx_status (status),
 
     CONSTRAINT fk_freezes_subscription FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE RESTRICT,
     CONSTRAINT fk_freezes_created_by FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL

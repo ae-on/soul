@@ -337,9 +337,145 @@ class Subscription(BaseModel):
                 conn.commit()
                 return cur.rowcount > 0
 
+    @classmethod
+    def extend_expires(cls, subscription_id: int, days: int) -> bool:
+        """
+        Сдвинуть expires_at на N дней вперёд (при заморозке).
+        Для абонементов без срока (expires_at IS NULL) —
+        срок считается от текущего момента.
+        """
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE subscriptions
+                       SET expires_at = DATE_ADD(
+                           COALESCE(expires_at, NOW()), INTERVAL %s DAY
+                       )
+                       WHERE id = %s""",
+                    (days, subscription_id),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info(
+                        "Абонемент %s продлён на %s дней", subscription_id, days
+                    )
+                return ok
+
 
 class Freeze(BaseModel):
     TABLE = "freezes"
+
+    @classmethod
+    def get_active_for_subscription(cls, subscription_id: int) -> dict | None:
+        """
+        Активная заморозка (status='approved' и end_date >= CURDATE()).
+        Возвращает dict или None.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM freezes
+                       WHERE subscription_id = %s
+                         AND status = 'approved'
+                         AND end_date >= CURDATE()
+                       ORDER BY end_date DESC
+                       LIMIT 1""",
+                    (subscription_id,),
+                )
+                return cur.fetchone()
+
+    @classmethod
+    def get_pending(cls) -> list[dict]:
+        """Все заявки со status='pending'."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM freezes
+                       WHERE status = 'pending'
+                       ORDER BY created_at"""
+                )
+                return cur.fetchall()
+
+    @classmethod
+    def approve(cls, freeze_id: int, admin_id: int) -> bool:
+        """status='approved', reviewed_by=admin_id, reviewed_at=NOW()."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE freezes
+                       SET status = 'approved',
+                           reviewed_by = %s,
+                           reviewed_at = NOW()
+                       WHERE id = %s""",
+                    (admin_id, freeze_id),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info(
+                        "Заморозка %s одобрена админом %s", freeze_id, admin_id
+                    )
+                return ok
+
+    @classmethod
+    def reject(cls, freeze_id: int, admin_id: int) -> bool:
+        """status='rejected', reviewed_by=admin_id, reviewed_at=NOW()."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE freezes
+                       SET status = 'rejected',
+                           reviewed_by = %s,
+                           reviewed_at = NOW()
+                       WHERE id = %s""",
+                    (admin_id, freeze_id),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info(
+                        "Заморозка %s отклонена админом %s", freeze_id, admin_id
+                    )
+                return ok
+
+    @classmethod
+    def cancel(cls, freeze_id: int) -> bool:
+        """status='cancelled'. Для отмены клиентом."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE freezes
+                       SET status = 'cancelled'
+                       WHERE id = %s""",
+                    (freeze_id,),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info("Заморозка %s отменена", freeze_id)
+                return ok
+
+    @classmethod
+    def complete(cls, freeze_id: int, actual_end_date, days_actual: int) -> bool:
+        """status='completed', actual_end_date, days_actual."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE freezes
+                       SET status = 'completed',
+                           actual_end_date = %s,
+                           days_actual = %s
+                       WHERE id = %s""",
+                    (actual_end_date, days_actual, freeze_id),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info(
+                        "Заморозка %s завершена: %s дней", freeze_id, days_actual
+                    )
+                return ok
 
 
 class EventCache(BaseModel):
@@ -406,6 +542,27 @@ class Booking(BaseModel):
 
 class Visit(BaseModel):
     TABLE = "visits"
+
+    @classmethod
+    def get_by_user(cls, user_id: int, limit: int = 20) -> list[dict]:
+        """
+        Последние посещения пользователя, DESC по marked_at.
+        JOIN с events_cache по em_event_id для получения названия.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT v.*, e.name AS event_name,
+                              e.start_date AS event_date,
+                              e.start_time AS event_time
+                       FROM visits v
+                       LEFT JOIN events_cache e ON e.em_event_id = v.em_event_id
+                       WHERE v.user_id = %s
+                       ORDER BY v.marked_at DESC
+                       LIMIT %s""",
+                    (user_id, limit),
+                )
+                return cur.fetchall()
 
 
 class Payment(BaseModel):
