@@ -623,20 +623,6 @@ async def show_schedule_day(
     await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
 
-# ---------------------------------------------------------------------------
-# Безопасное редактирование сообщения (игнорирует BadRequest "not modified")
-# ---------------------------------------------------------------------------
-async def _safe_edit(query, text: str, reply_markup=None):
-    """Вызывает edit_message_text, игнорируя ошибку 'Message is not modified'."""
-    try:
-        await query.edit_message_text(text, reply_markup=reply_markup)
-    except BadRequest as e:
-        if "Message is not modified" in str(e):
-            pass
-        else:
-            raise
-
-
 async def book_event_stub(
     update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: int
 ):
@@ -877,19 +863,19 @@ async def show_menu_by_role(
     keyboard.append(
         [
             InlineKeyboardButton(
+                "\U0001f4b0 Мой абонемент", callback_data="my_subscription"
+            )
+        ]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton(
                 "\U0001f4c5 Расписание и запись", callback_data="schedule"
             )
         ]
     )
     keyboard.append(
         [InlineKeyboardButton("\U0001f9ed Направления", callback_data="directions")]
-    )
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                "\U0001f4b0 Мой абонемент", callback_data="my_subscription"
-            )
-        ]
     )
     keyboard.append(
         [InlineKeyboardButton("\U0001f464 Профиль", callback_data="profile")]
@@ -1078,11 +1064,15 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.append(f"Осталось: {hours_left_f} часов")
         lines.append(f"≈ {n_one} занятий по 1ч или {n_half} по 1.5ч")
 
+    # Активная заморозка — определяем заранее (для пометки у «Действует до»)
+    active_freeze = Freeze.get_active_for_subscription(sub["id"])
+
     expires_at = sub.get("expires_at")
     if expires_at:
         days_left = (expires_at.date() - date.today()).days
+        freeze_note = " (с учётом заморозки)" if active_freeze else ""
         lines.append(
-            f"Действует до: {_format_date(expires_at)} ({days_left} дней)"
+            f"Действует до: {_format_date(expires_at)} ({days_left} дней){freeze_note}"
         )
     else:
         lines.append("Действует до: без ограничений")
@@ -1111,13 +1101,12 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
 
     # Активная заморозка — дополнительный блок и кнопка отмены
-    freeze = Freeze.get_active_for_subscription(sub["id"])
-    if freeze:
-        freeze_days_left = (freeze["end_date"] - date.today()).days
+    if active_freeze:
+        freeze_days_left = (active_freeze["end_date"] - date.today()).days
         text += (
             "\n\n\U0001f9ca Активная заморозка: "
-            f"с {_format_date(freeze['start_date'])} "
-            f"по {_format_date(freeze['end_date'])}\n"
+            f"с {_format_date(active_freeze['start_date'])} "
+            f"по {_format_date(active_freeze['end_date'])}\n"
             f"(осталось {freeze_days_left} дней)"
         )
         keyboard.append(
@@ -1135,7 +1124,7 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def show_subscription_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """История посещений пользователя (последние 20)."""
+    """Объединённая история: покупки, заморозки, посещения (последние 20)."""
     query = update.callback_query
     await safe_answer(query)
 
@@ -1145,30 +1134,60 @@ async def show_subscription_history(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("Ошибка загрузки. Нажмите /start.")
         return
 
-    visits = Visit.get_by_user(user["id"], limit=20)
+    items = User.get_history(user["id"], limit=20)
 
-    if not visits:
-        text = "\U0001f4c5 История посещений\n\nПока нет посещений."
+    if not items:
+        text = "\U0001f4c5 История\n\nПока нет записей."
     else:
-        lines = ["\U0001f4c5 История посещений (последние 20)", ""]
-        for v in visits:
-            visit_status = (v.get("status") or "").lower()
-            event_name = v.get("event_name") or f"Событие #{v.get('em_event_id')}"
-            event_date = _format_date(v.get("event_date") or v.get("marked_at"))
-            hours = v.get("hours_charged")
-            hours_str = f"{hours}ч" if hours is not None else "—"
+        lines = ["\U0001f4c5 История (последние 20)", ""]
+        for item in items:
+            date_str = _format_date(item.get("date"))
+            item_type = item.get("type")
 
-            if visit_status in ("present", "attended", "registered"):
-                icon = "\u2705"
-                line = f"{event_date} · {event_name} · {hours_str}"
-            elif visit_status == "cancelled":
-                icon = "\u274c"
-                line = f"{event_date} · {event_name} · отменено"
+            if item_type == "purchase":
+                type_name = item.get("type_name") or "Абонемент"
+                hours = item.get("hours")
+                hours_str = f"{hours}ч" if hours is not None else "безлимит"
+                lines.append(
+                    f"\U0001f4e6 {date_str} · Куплен абонемент \"{type_name}\" ({hours_str})"
+                )
+            elif item_type == "freeze":
+                reason = item.get("reason") or "—"
+                days = item.get("days")
+                days_str = f"{days} дней" if days is not None else "—"
+                lines.append(
+                    f"\U0001f9ca {date_str} · Заморозка: {reason} ({days_str})"
+                )
             else:
-                # absent / no_show / late_cancel / skipped
-                icon = "\u26a0\ufe0f"
-                line = f"{event_date} · {event_name} · пропуск"
-            lines.append(f"{icon} {line}")
+                # — visit —
+                visit_status = (item.get("status") or "").lower()
+                em_event_id = item.get("em_event_id")
+                # em_event_id == 0 — ручная отметка админом (без события из EM)
+                manual = not em_event_id
+                hours = item.get("hours")
+                hours_str = f"{hours}ч" if hours is not None else "—"
+
+                if visit_status in ("present", "attended", "registered"):
+                    icon = "\u2705"
+                    if manual:
+                        line = f"{date_str} · \u270d\ufe0f Ручное списание · {hours_str}"
+                    else:
+                        event_name = item.get("event_name") or f"Событие #{em_event_id}"
+                        line = f"{date_str} · {event_name} · {hours_str}"
+                elif manual:
+                    # Ручная отметка с пропуском
+                    icon = "\u26a0\ufe0f"
+                    line = f"{date_str} · \u270d\ufe0f Ручной пропуск"
+                elif visit_status == "cancelled":
+                    icon = "\u274c"
+                    event_name = item.get("event_name") or f"Событие #{em_event_id}"
+                    line = f"{date_str} · {event_name} · отменено"
+                else:
+                    # absent / no_show / late_cancel / skipped
+                    icon = "\u26a0\ufe0f"
+                    event_name = item.get("event_name") or f"Событие #{em_event_id}"
+                    line = f"{date_str} · {event_name} · пропуск"
+                lines.append(f"{icon} {line}")
         text = "\n".join(lines)
 
     keyboard = [
@@ -1420,13 +1439,27 @@ async def handle_freeze_approve(
     if not freeze:
         await safe_answer(query, "Заявка не найдена", show_alert=True)
         return
+    # Защита от двойного нажатия: обрабатываем только pending-заявки
     if freeze["status"] != "pending":
-        await query.edit_message_text("\u26a0\ufe0f Заявка уже обработана.")
+        await safe_answer(query, "Эта заявка уже обработана", show_alert=True)
+        return
+    # Защита: у абонемента не должно быть другой активной заморозки
+    if Freeze.get_active_for_subscription(freeze["subscription_id"]):
+        await safe_answer(query, "У абонемента уже есть активная заморозка", show_alert=True)
         return
 
     Freeze.approve(freeze_id, admin["id"])
     Subscription.update_freeze_used(freeze["subscription_id"], 1)
-    logger.info("Админ %s одобрил заморозку %s", admin["id"], freeze_id)
+    # Сдвигаем срок абонемента на дни заморозки ровно один раз (после approve)
+    freeze_days = freeze.get("days") or 0
+    if freeze_days > 0:
+        Subscription.extend_expires(freeze["subscription_id"], freeze_days)
+    logger.info(
+        "Админ %s одобрил заморозку %s (абонемент продлён на %s дней)",
+        admin["id"],
+        freeze_id,
+        freeze_days,
+    )
 
     # Уведомляем клиента
     sub = Subscription.get_by_id(freeze["subscription_id"])
@@ -1438,7 +1471,8 @@ async def handle_freeze_approve(
                 text=(
                     "\u2705 Ваша заморозка подтверждена "
                     f"с {_format_date(freeze['start_date'])} "
-                    f"по {_format_date(freeze['end_date'])}."
+                    f"по {_format_date(freeze['end_date'])}.\n"
+                    f"Абонемент продлён на {freeze_days} дней."
                 ),
             )
         except Exception as e:
@@ -1549,11 +1583,15 @@ def check_and_complete_freeze(user_id: int) -> bool:
     days_actual = max(1, (actual_end - start).days + 1)
 
     Freeze.complete(freeze["id"], actual_end, days_actual)
-    Subscription.extend_expires(sub["id"], days_actual)
+    # Дни были добавлены к expires_at при одобрении — вычитаем неиспользованные
+    remaining = (freeze.get("days") or 0) - days_actual
+    if remaining > 0:
+        Subscription.extend_expires(sub["id"], -remaining)
     logger.info(
-        "Заморозка завершена досрочно, абонемент %s продлен на %s дней",
+        "Заморозка завершена досрочно, абонемент %s: использовано %s из %s дней",
         sub["id"],
         days_actual,
+        freeze.get("days") or 0,
     )
     return True
 
@@ -2330,6 +2368,28 @@ def _format_user_line(idx: int, u: dict) -> str:
     return f"{idx}. {name} (ID: {u.get('telegram_id')}) — {emoji} {u.get('status')}"
 
 
+def _short_name(full_name: str) -> str:
+    """«Иванов Александр» → «Иванов А.»."""
+    parts = full_name.split()
+    if len(parts) >= 2:
+        return f"{parts[0]} {parts[1][0]}."
+    return full_name or "—"
+
+
+def _client_button_label(u: dict) -> str:
+    """Подпись кнопки клиента: «Иванов А. · 8ч» / «Петров И. · нет абона» / «Сидоров П. · новый»."""
+    name = _short_name(u.get("full_name") or u.get("username") or f"ID {u.get('telegram_id')}")
+    hours_left = u.get("hours_left")
+    if hours_left is not None:
+        # Decimal из MySQL приводим к float и убираем лишние нули (8.0 → 8)
+        suffix = f"{float(hours_left):g}ч"
+    elif u.get("status") == "new":
+        suffix = "новый"
+    else:
+        suffix = "нет абона"
+    return f"{name} · {suffix}"
+
+
 async def show_admin_clients(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2352,8 +2412,9 @@ async def show_admin_clients(
         page = total_pages
 
     offset = (page - 1) * CLIENTS_PER_PAGE
-    users = User.get_by_role(
-        "student", limit=CLIENTS_PER_PAGE, offset=offset, status_filter=status_filter
+    # Клиенты с остатком часов активного абонемента (для кнопок)
+    users = User.get_clients_for_admin(
+        limit=CLIENTS_PER_PAGE, offset=offset, status_filter=status_filter
     )
 
     # Фильтры по статусу (всегда сбрасывают на первую страницу)
@@ -2365,7 +2426,7 @@ async def show_admin_clients(
 
     if total == 0:
         # Пустой список: фильтры остаются, пагинация скрыта
-        text = f"\U0001f465 Клиенты (Всего: 0)\n\nНичего не найдено."
+        text = "\U0001f465 Клиенты (Всего: 0)\n\nНичего не найдено."
         keyboard = [
             filter_row,
             [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")],
@@ -2373,17 +2434,18 @@ async def show_admin_clients(
         await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
         return
 
-    lines = [f"\U0001f465 Клиенты (Всего: {total})", ""]
-    for i, u in enumerate(users, start=offset + 1):
-        lines.append(_format_user_line(i, u))
-    text = "\n".join(lines)
+    text = f"\U0001f465 Клиенты (Всего: {total})\nВыберите клиента для управления:"
 
     keyboard = [filter_row]
-    # Клик по имени клиента — карточка пользователя
+    # Клики по кнопкам клиентов — карточка пользователя
     for u in users:
-        name = u.get("full_name") or u.get("username") or f"ID {u.get('telegram_id')}"
         keyboard.append(
-            [InlineKeyboardButton(f"\U0001f464 {name}", callback_data=f"admin_user_{u['id']}")]
+            [
+                InlineKeyboardButton(
+                    f"\U0001f464 {_client_button_label(u)}",
+                    callback_data=f"admin_user_{u['id']}",
+                )
+            ]
         )
 
     # Навигация: стрелки только если есть куда листать
@@ -3113,13 +3175,17 @@ async def handle_admin_sub_unfreeze(
     days = max(1, (actual_end - start).days + 1)
 
     Freeze.complete(freeze["id"], actual_end, days)
-    Subscription.extend_expires(sub_id, days)
+    # Дни были добавлены к expires_at при одобрении — вычитаем неиспользованные
+    remaining = (freeze.get("days") or 0) - days
+    if remaining > 0:
+        Subscription.extend_expires(sub_id, -remaining)
     logger.info(
-        "Админ %s снял заморозку %s (абонемент %s), возвращено %s дней",
+        "Админ %s снял заморозку %s (абонемент %s): использовано %s из %s дней",
         admin["id"],
         freeze["id"],
         sub_id,
         days,
+        freeze.get("days") or 0,
     )
 
     # Уведомляем клиента

@@ -6,7 +6,7 @@
 """
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Optional
 
 import pymysql
@@ -313,6 +313,95 @@ class User(BaseModel):
                     )
                 row = cur.fetchone()
                 return row["cnt"] if row else 0
+
+    @classmethod
+    def get_history(cls, user_id: int, limit: int = 20) -> list[dict]:
+        """
+        Объединённая история пользователя: покупки, заморозки, посещения.
+        Сортировка по дате DESC. Каждая запись содержит 'type':
+        'purchase' | 'freeze' | 'visit'.
+        """
+        items = []
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                # Покупки абонементов
+                cur.execute(
+                    """SELECT s.purchased_at AS date,
+                              st.name AS type_name,
+                              st.hours_count AS hours
+                       FROM subscriptions s
+                       LEFT JOIN subscription_types st ON st.id = s.type_id
+                       WHERE s.user_id = %s""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "purchase"
+                    items.append(row)
+
+                # Заморозки
+                cur.execute(
+                    """SELECT f.start_date AS date, f.reason, f.days, f.status
+                       FROM freezes f
+                       JOIN subscriptions s ON s.id = f.subscription_id
+                       WHERE s.user_id = %s""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "freeze"
+                    items.append(row)
+
+                # Посещения
+                cur.execute(
+                    """SELECT v.marked_at AS date, v.status,
+                              v.hours_charged AS hours,
+                              v.em_event_id, e.name AS event_name
+                       FROM visits v
+                       LEFT JOIN events_cache e ON e.em_event_id = v.em_event_id
+                       WHERE v.user_id = %s""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "visit"
+                    items.append(row)
+
+        # Сортировка по дате DESC (datetime и date приводим к одному типу)
+        def _sort_key(x: dict):
+            value = x.get("date")
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, date):
+                return datetime.combine(value, datetime.min.time())
+            return datetime.min
+
+        items.sort(key=_sort_key, reverse=True)
+        return items[:limit]
+
+    @classmethod
+    def get_clients_for_admin(
+        cls, limit: int = 10, offset: int = 0, status_filter: str = "all"
+    ) -> list[dict]:
+        """
+        Клиенты (роль student) для админки.
+        Подтягивает hours_left активного абонемента (скалярный подзапрос),
+        чтобы на кнопках показывать остаток часов.
+        status_filter: 'all' | 'new' | 'active'. Сортировка по full_name ASC.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT u.id, u.full_name, u.username, u.status, u.telegram_id,
+                              (SELECT s.hours_left FROM subscriptions s
+                               WHERE s.user_id = u.id AND s.status = 'active'
+                               ORDER BY s.created_at DESC LIMIT 1) AS hours_left
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id
+                         AND ur.role = 'student' AND ur.active = 1
+                       WHERE %s = 'all' OR u.status = %s
+                       ORDER BY u.full_name ASC
+                       LIMIT %s OFFSET %s""",
+                    (status_filter, status_filter, limit, offset),
+                )
+                return cur.fetchall()
 
 
 class SubscriptionType(BaseModel):
