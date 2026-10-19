@@ -106,6 +106,17 @@ def _extract_two_ints(data: str, prefix: str) -> Optional[tuple[int, int]]:
         return None
 
 
+def _parse_sub_hours(data: str, prefix: str) -> Optional[tuple[int, float]]:
+    """Разбирает «prefix{sub_id}_{hours}» -> (sub_id, hours); None при неудаче."""
+    parts = data[len(prefix):].split("_", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+
+
 async def notify_admin(
     context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None
 ) -> bool:
@@ -1078,7 +1089,7 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("\U0001f9ca Заморозить", callback_data="sub_freeze")],
         [
             InlineKeyboardButton(
-                "\U0001f3e2 Продлить в студии", callback_data="sub_buy_offline"
+                "\U0001f3e2 Купить на занятии", callback_data="sub_buy_offline"
             )
         ],
         [
@@ -1323,6 +1334,18 @@ async def submit_freeze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     start, end, days = _calc_freeze_period(sub.get("expires_at"))
+
+    # Строгая защита: период заморозки не может выходить за срок абонемента
+    if sub.get("expires_at"):
+        max_end = (
+            sub["expires_at"].date()
+            if isinstance(sub["expires_at"], datetime)
+            else sub["expires_at"]
+        )
+        if end > max_end:
+            end = max_end
+            days = (end - start).days + 1
+
     reason_label = FREEZE_REASONS.get(reason_key, reason_key)
 
     # days — generated column в MySQL, её НЕ передаём
@@ -2791,10 +2814,18 @@ async def show_admin_sub_manage(
     keyboard = [
         [
             InlineKeyboardButton(
-                "\u2795 Добавить 1ч", callback_data=f"admin_sub_add_hours_{sub_id}"
+                "\u2795 1.0ч", callback_data=f"admin_sub_add_hours_{sub_id}_1.0"
             ),
             InlineKeyboardButton(
-                "\u2796 Списать 1ч", callback_data=f"admin_sub_sub_hours_{sub_id}"
+                "\u2796 1.0ч", callback_data=f"admin_sub_sub_hours_{sub_id}_1.0"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\u2795 1.5ч", callback_data=f"admin_sub_add_hours_{sub_id}_1.5"
+            ),
+            InlineKeyboardButton(
+                "\u2796 1.5ч", callback_data=f"admin_sub_sub_hours_{sub_id}_1.5"
             ),
         ],
         [
@@ -2809,19 +2840,44 @@ async def show_admin_sub_manage(
                 callback_data=f"admin_sub_visit_{sub_id}",
             )
         ],
+    ]
+
+    # Управление заморозкой абонемента
+    if Freeze.get_active_for_subscription(sub_id):
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f525 Снять заморозку",
+                    callback_data=f"admin_sub_unfreeze_{sub_id}",
+                )
+            ]
+        )
+    else:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f9ca Заморозить (14 дней)",
+                    callback_data=f"admin_sub_freeze_{sub_id}",
+                )
+            ]
+        )
+
+    keyboard.append(
         [
             InlineKeyboardButton(
                 "\u274c Отменить абонемент",
                 callback_data=f"admin_sub_cancel_{sub_id}",
             )
-        ],
+        ]
+    )
+    keyboard.append(
         [
             InlineKeyboardButton(
                 "\U0001f519 Назад",
                 callback_data=f"admin_user_subs_{sub['user_id']}",
             )
-        ],
-    ]
+        ]
+    )
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if query:
@@ -2831,27 +2887,153 @@ async def show_admin_sub_manage(
 
 
 async def handle_sub_add_hours(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int, hours: float
 ):
-    """Быстрое добавление 1 часа к абонементу."""
+    """Добавление часов к абонементу (1.0 / 1.5)."""
     admin = await _require_admin(update, context)
     if not admin:
         return
-    if Subscription.update_hours(sub_id, 1.0):
-        logger.info("Админ %s добавил 1ч абонементу %s", admin["id"], sub_id)
+    if Subscription.update_hours(sub_id, hours):
+        logger.info("Админ %s добавил %sч абонементу %s", admin["id"], hours, sub_id)
     await show_admin_sub_manage(update, context, sub_id)
 
 
 async def handle_sub_sub_hours(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int, hours: float
 ):
-    """Быстрое списание 1 часа (не ниже 0)."""
+    """Списание часов с абонемента (1.0 / 1.5, не ниже 0)."""
     admin = await _require_admin(update, context)
     if not admin:
         return
-    if Subscription.update_hours(sub_id, -1.0):
-        logger.info("Админ %s списал 1ч с абонемента %s", admin["id"], sub_id)
+    if Subscription.update_hours(sub_id, -hours):
+        logger.info("Админ %s списал %sч с абонемента %s", admin["id"], hours, sub_id)
     await show_admin_sub_manage(update, context, sub_id)
+
+
+async def handle_admin_sub_freeze(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
+):
+    """Админ замораживает абонемент на 14 дней (или до конца срока)."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    sub = Subscription.get_by_id(sub_id)
+    if not sub:
+        await safe_answer(query, "Абонемент не найден", show_alert=True)
+        return
+
+    # Активная заморозка уже есть — не дублируем
+    if Freeze.get_active_for_subscription(sub_id):
+        await safe_answer(
+            query, "У абонемента уже есть активная заморозка", show_alert=True
+        )
+        return
+
+    # Доступные дни: min(14, остаток срока абонемента)
+    today = date.today()
+    if sub.get("expires_at"):
+        exp_date = (
+            sub["expires_at"].date()
+            if isinstance(sub["expires_at"], datetime)
+            else sub["expires_at"]
+        )
+        days = min(FREEZE_MAX_DAYS, (exp_date - today).days)
+    else:
+        days = FREEZE_MAX_DAYS
+    if days <= 0:
+        await safe_answer(
+            query, "Абонемент заканчивается — заморозка невозможна", show_alert=True
+        )
+        return
+
+    start = today
+    end = today + timedelta(days=days)
+
+    # days — generated column в MySQL, её НЕ передаём
+    Freeze.create(
+        subscription_id=sub_id,
+        start_date=start,
+        end_date=end,
+        reason="По решению админа",
+        created_by=admin["id"],
+        status="approved",
+    )
+    Subscription.update_freeze_used(sub_id, 1)
+    logger.info("Админ %s заморозил абонемент %s на %s дней", admin["id"], sub_id, days)
+
+    # Уведомляем клиента
+    client = User.get_by_id(sub["user_id"]) if sub.get("user_id") else None
+    if client and client.get("telegram_id"):
+        try:
+            await context.bot.send_message(
+                chat_id=client["telegram_id"],
+                text=f"\U0001f9ca Администратор заморозил ваш абонемент на {days} дней.",
+            )
+        except Exception as e:
+            logger.error(
+                "Не удалось уведомить клиента %s: %s", client["telegram_id"], e
+            )
+
+    await show_admin_sub_manage(
+        update, context, sub_id, notice=f"\U0001f9ca Абонемент заморожен на {days} дней"
+    )
+
+
+async def handle_admin_sub_unfreeze(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
+):
+    """Админ снимает заморозку досрочно: завершает и продлевает срок абонемента."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    freeze = Freeze.get_active_for_subscription(sub_id)
+    if not freeze:
+        await safe_answer(query, "Активная заморозка не найдена", show_alert=True)
+        return
+
+    # Завершаем сегодняшним днём и возвращаем фактические дни к expires_at
+    today = date.today()
+    start = freeze["start_date"]
+    if isinstance(start, datetime):
+        start = start.date()
+    end = freeze["end_date"]
+    if isinstance(end, datetime):
+        end = end.date()
+
+    actual_end = min(today, end)
+    days = max(1, (actual_end - start).days + 1)
+
+    Freeze.complete(freeze["id"], actual_end, days)
+    Subscription.extend_expires(sub_id, days)
+    logger.info(
+        "Админ %s снял заморозку %s (абонемент %s), возвращено %s дней",
+        admin["id"],
+        freeze["id"],
+        sub_id,
+        days,
+    )
+
+    # Уведомляем клиента
+    sub = Subscription.get_by_id(sub_id)
+    client = User.get_by_id(sub["user_id"]) if sub and sub.get("user_id") else None
+    if client and client.get("telegram_id"):
+        try:
+            await context.bot.send_message(
+                chat_id=client["telegram_id"],
+                text="\U0001f525 Заморозка снята досрочно.",
+            )
+        except Exception as e:
+            logger.error(
+                "Не удалось уведомить клиента %s: %s", client["telegram_id"], e
+            )
+
+    await show_admin_sub_manage(
+        update, context, sub_id, notice="\U0001f525 Заморозка снята досрочно"
+    )
 
 
 async def admin_sub_expires_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3513,17 +3695,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await admin_sub_type_handler(update, context, uid, tid)
             return
 
-    # Быстрое изменение часов
+    # Быстрое изменение часов: admin_sub_add_hours_{sub_id}_{hours}
     if data.startswith("admin_sub_add_hours_"):
-        sid = _extract_int(data, "admin_sub_add_hours_")
-        if sid is not None:
-            await handle_sub_add_hours(update, context, sid)
+        parsed = _parse_sub_hours(data, "admin_sub_add_hours_")
+        if parsed:
+            sid, hours = parsed
+            await handle_sub_add_hours(update, context, sid, hours)
             return
 
     if data.startswith("admin_sub_sub_hours_"):
-        sid = _extract_int(data, "admin_sub_sub_hours_")
+        parsed = _parse_sub_hours(data, "admin_sub_sub_hours_")
+        if parsed:
+            sid, hours = parsed
+            await handle_sub_sub_hours(update, context, sid, hours)
+            return
+
+    # Заморозка из админки
+    if data.startswith("admin_sub_freeze_"):
+        sid = _extract_int(data, "admin_sub_freeze_")
         if sid is not None:
-            await handle_sub_sub_hours(update, context, sid)
+            await handle_admin_sub_freeze(update, context, sid)
+            return
+
+    if data.startswith("admin_sub_unfreeze_"):
+        sid = _extract_int(data, "admin_sub_unfreeze_")
+        if sid is not None:
+            await handle_admin_sub_unfreeze(update, context, sid)
             return
 
     # Смена даты окончания (обычно перехватывает ConversationHandler)
