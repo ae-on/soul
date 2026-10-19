@@ -467,6 +467,21 @@ class Subscription(BaseModel):
                     logger.info("Абонемент %s: статус -> %s", sub_id, status)
                 return ok
 
+    @classmethod
+    def increment_freeze_used(cls, sub_id: int) -> bool:
+        """Увеличить счётчик использованных заморозок на 1 (при одобрении)."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE subscriptions SET freeze_used = freeze_used + 1 WHERE id = %s",
+                    (sub_id,),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info("Абонемент %s: freeze_used +1", sub_id)
+                return ok
+
 
 class Freeze(BaseModel):
     TABLE = "freezes"
@@ -484,6 +499,25 @@ class Freeze(BaseModel):
                        WHERE subscription_id = %s
                          AND status = 'approved'
                          AND end_date >= CURDATE()
+                       ORDER BY end_date DESC
+                       LIMIT 1""",
+                    (subscription_id,),
+                )
+                return cur.fetchone()
+
+    @classmethod
+    def get_approved_started(cls, subscription_id: int) -> dict | None:
+        """
+        Одобренная заморозка, которая уже началась (start_date <= CURDATE()).
+        Используется для автозавершения при возврате клиента.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM freezes
+                       WHERE subscription_id = %s
+                         AND status = 'approved'
+                         AND start_date <= CURDATE()
                        ORDER BY end_date DESC
                        LIMIT 1""",
                     (subscription_id,),
