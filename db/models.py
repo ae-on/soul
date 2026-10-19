@@ -255,6 +255,65 @@ class User(BaseModel):
                 counts["total"] = cur.fetchone()["total"]
                 return counts
 
+    @classmethod
+    def get_by_role(
+        cls,
+        role: str,
+        limit: int = 10,
+        offset: int = 0,
+        status_filter: str = "all",
+    ) -> list[dict]:
+        """
+        Пользователи по роли (student/teacher/admin) из таблицы user_roles.
+        status_filter: 'all', 'new', 'active'.
+        Сортировка по full_name ASC.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                if status_filter == "all":
+                    cur.execute(
+                        """SELECT u.* FROM users u
+                           JOIN user_roles ur ON ur.user_id = u.id
+                           WHERE ur.role = %s AND ur.active = 1
+                           ORDER BY u.full_name ASC
+                           LIMIT %s OFFSET %s""",
+                        (role, limit, offset),
+                    )
+                else:
+                    cur.execute(
+                        """SELECT u.* FROM users u
+                           JOIN user_roles ur ON ur.user_id = u.id
+                           WHERE ur.role = %s AND ur.active = 1
+                             AND u.status = %s
+                           ORDER BY u.full_name ASC
+                           LIMIT %s OFFSET %s""",
+                        (role, status_filter, limit, offset),
+                    )
+                return cur.fetchall()
+
+    @classmethod
+    def count_by_role(cls, role: str, status_filter: str = "all") -> int:
+        """Количество пользователей с ролью (для пагинации)."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                if status_filter == "all":
+                    cur.execute(
+                        """SELECT COUNT(*) AS cnt FROM user_roles
+                           WHERE role = %s AND active = 1""",
+                        (role,),
+                    )
+                else:
+                    cur.execute(
+                        """SELECT COUNT(*) AS cnt
+                           FROM user_roles ur
+                           JOIN users u ON u.id = ur.user_id
+                           WHERE ur.role = %s AND ur.active = 1
+                             AND u.status = %s""",
+                        (role, status_filter),
+                    )
+                row = cur.fetchone()
+                return row["cnt"] if row else 0
+
 
 class SubscriptionType(BaseModel):
     TABLE = "subscription_types"
@@ -686,7 +745,7 @@ class Booking(BaseModel):
     def count_confirmed_for_event(cls, em_event_id: int) -> int:
         """Количество записанных (для проверки лимита)."""
         with get_connection() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(DictCursor) as cur:
                 cur.execute(
                     """SELECT COUNT(*) as cnt FROM bookings
                        WHERE em_event_id = %s

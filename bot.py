@@ -65,6 +65,16 @@ async def safe_answer(query, text=None, show_alert=False):
         logger.warning("Не удалось ответить на callback (%s): %s", type(e).__name__, e)
 
 
+async def _safe_edit(query, text: str, reply_markup=None):
+    """Редактирует сообщение, игнорируя «Message is not modified»."""
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            return
+        raise
+
+
 def _format_date(value) -> str:
     """Форматирует дату как ДД.ММ.ГГГГ; None превращает в «—»."""
     if value is None:
@@ -2288,9 +2298,10 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = [
-        [InlineKeyboardButton("\U0001f465 Пользователи", callback_data="admin_users")],
-        [InlineKeyboardButton("\U0001f3ab Роли", callback_data="admin_roles")],
-        [InlineKeyboardButton("\U0001f3e0 Главное меню", callback_data="back_to_main")],
+        [InlineKeyboardButton("\U0001f465 Клиенты", callback_data="admin_clients")],
+        [InlineKeyboardButton("\U0001f9d1\u200d\U0001f3eb Учителя", callback_data="admin_teachers")],
+        [InlineKeyboardButton("\U0001f527 Админы", callback_data="admin_admins")],
+        [InlineKeyboardButton("\U0001f519 Главное меню", callback_data="back_to_main")],
     ]
     text = "\U0001f527 Панель администратора"
     await update.callback_query.edit_message_text(
@@ -2298,96 +2309,190 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def show_admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сводка по пользователям."""
-    user = await _require_admin(update, context)
-    if not user:
-        return
+# Число клиентов на страницу в списке админки
+CLIENTS_PER_PAGE = 10
 
-    counts = User.count_by_status()
-    text = (
-        "\U0001f465 Пользователи\n\n"
-        f"\U0001f195 Новые (без регистрации): {counts.get('new', 0)}\n"
-        f"\u2705 Активные: {counts.get('active', 0)}\n"
-        f"\u23f3 Истёкшие: {counts.get('expired', 0)}\n"
-        f"\U0001f4e6 Всего: {counts.get('total', 0)}"
-    )
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "\U0001f195 Новые", callback_data="admin_users_new"
-            ),
-            InlineKeyboardButton(
-                "\u2705 Активные", callback_data="admin_users_active"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "\U0001f4e6 Все", callback_data="admin_users_all"
-            )
-        ],
-        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_panel")],
-    ]
-    await update.callback_query.edit_message_text(
-        text, reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+# Эмодзи для статусов пользователей в списках админки
+USER_STATUS_EMOJI = {
+    "new": "\U0001f195",
+    "active": "\u2705",
+    "expired": "\u23f3",
+    "archived": "\U0001f4e6",
+    "inactive": "\u26aa",
+    "deleted_data": "\U0001f5d1\ufe0f",
+}
 
 
-async def show_admin_users_list(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, status_filter: str = None
+def _format_user_line(idx: int, u: dict) -> str:
+    """Строка списка: «1. Иванов Александр (ID: 10000000) — ✅ active»."""
+    name = u.get("full_name") or u.get("username") or "—"
+    emoji = USER_STATUS_EMOJI.get(u.get("status"), "\u2022")
+    return f"{idx}. {name} (ID: {u.get('telegram_id')}) — {emoji} {u.get('status')}"
+
+
+async def show_admin_clients(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    page: int = 1,
+    status_filter: str = "all",
 ):
-    """Список пользователей по фильтру статуса."""
-    user = await _require_admin(update, context)
-    if not user:
+    """Список клиентов (роль student) с пагинацией и фильтром по статусу."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    total = User.count_by_role("student", status_filter=status_filter)
+    total_pages = max(1, math.ceil(total / CLIENTS_PER_PAGE))
+
+    # Защита от выхода за границы пагинации
+    if page < 1:
+        page = 1
+    if page > total_pages:
+        page = total_pages
+
+    offset = (page - 1) * CLIENTS_PER_PAGE
+    users = User.get_by_role(
+        "student", limit=CLIENTS_PER_PAGE, offset=offset, status_filter=status_filter
+    )
+
+    # Фильтры по статусу (всегда сбрасывают на первую страницу)
+    filter_row = [
+        InlineKeyboardButton("\U0001f195 Новые", callback_data="admin_clients_page_1_new"),
+        InlineKeyboardButton("\u2705 Активные", callback_data="admin_clients_page_1_active"),
+        InlineKeyboardButton("\U0001f4e6 Все", callback_data="admin_clients_page_1_all"),
+    ]
+
+    if total == 0:
+        # Пустой список: фильтры остаются, пагинация скрыта
+        text = f"\U0001f465 Клиенты (Всего: 0)\n\nНичего не найдено."
+        keyboard = [
+            filter_row,
+            [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")],
+        ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
         return
 
-    status_labels = {
-        "new": "\U0001f195 Новые (зарегистрировались в боте, но не прошли регистрацию)",
-        "active": "\u2705 Активные (прошли регистрацию)",
-    }
-    if status_filter:
-        title = status_labels.get(status_filter, f"Статус: {status_filter}")
-    else:
-        title = "\U0001f4e6 Все пользователи"
+    lines = [f"\U0001f465 Клиенты (Всего: {total})", ""]
+    for i, u in enumerate(users, start=offset + 1):
+        lines.append(_format_user_line(i, u))
+    text = "\n".join(lines)
 
-    users = User.list_by_status(status_filter=status_filter, limit=20)
-
-    if not users:
-        text = f"{title}\n\nНет пользователей."
-    else:
-        lines = [title, ""]
-        for i, u in enumerate(users, 1):
-            username = f"@{u['username']}" if u.get("username") else "—"
-            reg_date = u["registered_at"]
-            if reg_date:
-                reg_date = reg_date.strftime("%d.%m.%Y") if hasattr(reg_date, "strftime") else str(reg_date)[:10]
-            else:
-                reg_date = "—"
-            lines.append(
-                f"{i}. {u['full_name'] or '—'} — {username}\n"
-                f"   Статус: {u['status']}, зашёл: {reg_date}"
-            )
-        text = "\n".join(lines)
-
-    # Кнопка «Карточка» для каждого пользователя
-    keyboard = []
-    for u in users[:20]:
+    keyboard = [filter_row]
+    # Клик по имени клиента — карточка пользователя
+    for u in users:
+        name = u.get("full_name") or u.get("username") or f"ID {u.get('telegram_id')}"
         keyboard.append(
-            [
-                InlineKeyboardButton(
-                    f"\U0001f464 {u['full_name'] or u['username'] or u['id']}",
-                    callback_data=f"admin_user_{u['id']}",
-                )
-            ]
+            [InlineKeyboardButton(f"\U0001f464 {name}", callback_data=f"admin_user_{u['id']}")]
         )
 
-    # Кнопка назад — к сводке пользователей
+    # Навигация: стрелки только если есть куда листать
+    if total_pages > 1:
+        nav = []
+        if page > 1:
+            nav.append(
+                InlineKeyboardButton(
+                    "\u2b05\ufe0f",
+                    callback_data=f"admin_clients_page_{page - 1}_{status_filter}",
+                )
+            )
+        nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+        if page < total_pages:
+            nav.append(
+                InlineKeyboardButton(
+                    "\u27a1\ufe0f",
+                    callback_data=f"admin_clients_page_{page + 1}_{status_filter}",
+                )
+            )
+        keyboard.append(nav)
+
+        # Номера страниц [1] [2] [3] ... (активная страница — в скобках)
+        page_buttons = []
+        for p in range(1, total_pages + 1):
+            label = f"[{p}]" if p == page else str(p)
+            page_buttons.append(
+                InlineKeyboardButton(label, callback_data=f"admin_clients_page_{p}_{status_filter}")
+            )
+        for i in range(0, len(page_buttons), 5):
+            keyboard.append(page_buttons[i : i + 5])
+
     keyboard.append(
-        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_users")]
+        [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")]
     )
-    await update.callback_query.edit_message_text(
-        text, reply_markup=InlineKeyboardMarkup(keyboard)
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+
+async def show_admin_teachers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список учителей (роль teacher), без пагинации."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    users = User.get_by_role("teacher", limit=100, offset=0, status_filter="all")
+    total = User.count_by_role("teacher")
+
+    if not users:
+        text = f"\U0001f9d1\u200d\U0001f3eb Учителя (Всего: {total})\n\nНет пользователей."
+        keyboard = [
+            [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")]
+        ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    lines = [f"\U0001f9d1\u200d\U0001f3eb Учителя (Всего: {total})", ""]
+    for i, u in enumerate(users, 1):
+        lines.append(_format_user_line(i, u))
+    text = "\n".join(lines)
+
+    keyboard = []
+    for u in users:
+        name = u.get("full_name") or u.get("username") or f"ID {u.get('telegram_id')}"
+        keyboard.append(
+            [InlineKeyboardButton(f"\U0001f464 {name}", callback_data=f"admin_user_{u['id']}")]
+        )
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")]
     )
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+
+async def show_admin_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список администраторов (роли admin и super_admin), без пагинации."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    # Объединяем admin и super_admin, дедуплицируем по id
+    admins = User.get_by_role("admin", limit=100, offset=0, status_filter="all")
+    super_admins = User.get_by_role("super_admin", limit=100, offset=0, status_filter="all")
+    merged = {u["id"]: u for u in admins + super_admins}
+    users = sorted(merged.values(), key=lambda u: (u.get("full_name") or "").lower())
+
+    if not users:
+        text = "\U0001f527 Админы\n\nНет пользователей."
+        keyboard = [
+            [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")]
+        ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    lines = [f"\U0001f527 Админы (Всего: {len(users)})", ""]
+    for i, u in enumerate(users, 1):
+        lines.append(_format_user_line(i, u))
+    text = "\n".join(lines)
+
+    keyboard = []
+    for u in users:
+        name = u.get("full_name") or u.get("username") or f"ID {u.get('telegram_id')}"
+        keyboard.append(
+            [InlineKeyboardButton(f"\U0001f464 {name}", callback_data=f"admin_user_{u['id']}")]
+        )
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")]
+    )
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
 
 async def show_admin_user_card(
@@ -2439,7 +2544,7 @@ async def show_admin_user_card(
                 "\U0001f4b0 Абонементы", callback_data=f"admin_user_subs_{user_id}"
             ),
         ],
-        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_users")],
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_clients_page_1_all")],
     ]
     await update.callback_query.edit_message_text(
         text, reply_markup=InlineKeyboardMarkup(keyboard)
@@ -3602,20 +3707,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_admin_panel(update, context)
         return
 
-    if data == "admin_users":
-        await show_admin_users(update, context)
+    # --- Админка: клиенты с пагинацией ---
+    if data == "admin_clients":
+        await show_admin_clients(update, context)
         return
 
-    if data == "admin_users_new":
-        await show_admin_users_list(update, context, status_filter="new")
+    if data.startswith("admin_clients_page_"):
+        # Формат: admin_clients_page_{page}_{filter}
+        parts = data[len("admin_clients_page_"):].split("_", 1)
+        try:
+            page = int(parts[0])
+        except (ValueError, IndexError):
+            page = 1
+        if page < 1:
+            # Некорректный номер страницы — сбрасываем на первую
+            page = 1
+        status_filter = parts[1] if len(parts) == 2 and parts[1] in ("new", "active", "all") else "all"
+        await show_admin_clients(update, context, page=page, status_filter=status_filter)
         return
 
-    if data == "admin_users_active":
-        await show_admin_users_list(update, context, status_filter="active")
+    if data == "admin_teachers":
+        await show_admin_teachers(update, context)
         return
 
-    if data == "admin_users_all":
-        await show_admin_users_list(update, context)
+    if data == "admin_admins":
+        await show_admin_admins(update, context)
+        return
+
+    # Заглушка для неинтерактивных кнопок-индикаторов
+    if data == "noop":
         return
 
     if data == "admin_roles":
