@@ -468,18 +468,18 @@ class Subscription(BaseModel):
                 return ok
 
     @classmethod
-    def increment_freeze_used(cls, sub_id: int) -> bool:
-        """Увеличить счётчик использованных заморозок на 1 (при одобрении)."""
+    def update_freeze_used(cls, sub_id: int, delta: int = 1) -> bool:
+        """Изменить счётчик использованных заморозок на delta (обычно +1)."""
         with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE subscriptions SET freeze_used = freeze_used + 1 WHERE id = %s",
-                    (sub_id,),
+                    "UPDATE subscriptions SET freeze_used = GREATEST(0, freeze_used + %s) WHERE id = %s",
+                    (delta, sub_id),
                 )
                 conn.commit()
                 ok = cur.rowcount > 0
                 if ok:
-                    logger.info("Абонемент %s: freeze_used +1", sub_id)
+                    logger.info("Абонемент %s: freeze_used %+d", sub_id, delta)
                 return ok
 
 
@@ -500,6 +500,24 @@ class Freeze(BaseModel):
                          AND status = 'approved'
                          AND end_date >= CURDATE()
                        ORDER BY end_date DESC
+                       LIMIT 1""",
+                    (subscription_id,),
+                )
+                return cur.fetchone()
+
+    @classmethod
+    def get_open_for_subscription(cls, subscription_id: int) -> dict | None:
+        """
+        Незавершённая заморозка абонемента: pending (заявка) или approved (активная).
+        Возвращает dict или None.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM freezes
+                       WHERE subscription_id = %s
+                         AND status IN ('pending', 'approved')
+                       ORDER BY created_at DESC
                        LIMIT 1""",
                     (subscription_id,),
                 )

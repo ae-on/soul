@@ -1158,8 +1158,8 @@ async def show_subscription_history(update: Update, context: ContextTypes.DEFAUL
 # ----------------------------------------------------------------------
 FREEZE_REASONS = {
     "vacation": "\U0001f3d6\ufe0f Отпуск",
-    "business_trip": "\U0001f4bc Командировка",
-    "sickness": "\U0001f3e5 Болезнь",
+    "business": "\U0001f4bc Командировка",
+    "sick": "\U0001f3e5 Болезнь",
     "other": "\u270f\ufe0f Другое",
 }
 
@@ -1209,15 +1209,15 @@ async def show_sub_freeze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     max_freezes = sub_type["freeze_count_max"] if sub_type else 0
     if (sub.get("freeze_used") or 0) >= max_freezes:
-        text = "\u26a0\ufe0f Лимит заморозок для этого абонемента исчерпан."
+        text = "Вы уже использовали заморозку в этом абонементе."
         keyboard = [
             [InlineKeyboardButton("\U0001f519 Назад", callback_data="my_subscription")]
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    if Freeze.get_active_for_subscription(sub["id"]):
-        text = "\u26a0\ufe0f У вас уже есть активная заморозка."
+    if Freeze.get_open_for_subscription(sub["id"]):
+        text = "\u26a0\ufe0f У вас уже есть активная заморозка или заявка на рассмотрении."
         keyboard = [
             [InlineKeyboardButton("\U0001f519 Назад", callback_data="my_subscription")]
         ]
@@ -1243,13 +1243,12 @@ async def show_sub_freeze(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 FREEZE_REASONS["vacation"], callback_data="freeze_reason_vacation"
             ),
             InlineKeyboardButton(
-                FREEZE_REASONS["business_trip"],
-                callback_data="freeze_reason_business_trip",
+                FREEZE_REASONS["business"], callback_data="freeze_reason_business"
             ),
         ],
         [
             InlineKeyboardButton(
-                FREEZE_REASONS["sickness"], callback_data="freeze_reason_sickness"
+                FREEZE_REASONS["sick"], callback_data="freeze_reason_sick"
             ),
             InlineKeyboardButton(
                 FREEZE_REASONS["other"], callback_data="freeze_reason_other"
@@ -1275,6 +1274,9 @@ async def show_sub_freeze_confirm(
     start, end, days = _calc_freeze_period(sub.get("expires_at"))
     reason_label = FREEZE_REASONS.get(reason_key, reason_key)
 
+    # Запоминаем причину — на экране подтверждения кнопка freeze_confirm без данных
+    context.user_data["pending_freeze_reason"] = reason_key
+
     text = (
         "\U0001f9ca Заморозка абонемента\n\n"
         f"\U0001f4c5 Заморозка: с {_format_date(start)} "
@@ -1286,7 +1288,7 @@ async def show_sub_freeze_confirm(
     keyboard = [
         [
             InlineKeyboardButton(
-                "\u2705 Подтвердить", callback_data=f"freeze_confirm_{reason_key}"
+                "\u2705 Подтвердить", callback_data="freeze_confirm"
             )
         ],
         [InlineKeyboardButton("\U0001f519 Отмена", callback_data="sub_freeze")],
@@ -1294,19 +1296,27 @@ async def show_sub_freeze_confirm(
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def submit_freeze(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, reason_key: str
-):
+async def submit_freeze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Создание заявки на заморозку и уведомление админу."""
     query = update.callback_query
     await safe_answer(query)
+
+    # Причина была сохранена на предыдущем шаге (экран подтверждения)
+    reason_key = context.user_data.pop("pending_freeze_reason", None)
+    if not reason_key or reason_key not in FREEZE_REASONS:
+        await query.edit_message_text(
+            "\u26a0\ufe0f Действие устарело. Нажмите «\U0001f9ca Заморозить» заново."
+        )
+        return
 
     user, sub = _get_user_and_active_sub(update)
     if not user or not sub:
         await query.edit_message_text("\u26a0\ufe0f Активный абонемент не найден.")
         return
-    if Freeze.get_active_for_subscription(sub["id"]):
-        await query.edit_message_text("\u26a0\ufe0f У вас уже есть активная заморозка.")
+    if Freeze.get_open_for_subscription(sub["id"]):
+        await query.edit_message_text(
+            "\u26a0\ufe0f У вас уже есть активная заморозка или заявка на рассмотрении."
+        )
         return
 
     start, end, days = _calc_freeze_period(sub.get("expires_at"))
@@ -1331,12 +1341,12 @@ async def submit_freeze(
     )
 
     # Уведомление админу с кнопками подтверждения/отклонения.
-    # ФИО берём из БД (поле full_name), telegram_id — тоже из БД
+    # ФИО и telegram_id берём из БД (поле full_name таблицы users)
     full_name = user.get("full_name") or ""
     admin_msg = (
         "\U0001f9ca Заявка на заморозку\n\n"
         f"Клиент: {full_name or '—'} (ID {user.get('telegram_id')})\n"
-        f"Абонемент: #{sub['id']}, до {_format_date(sub.get('expires_at'))}\n"
+        f"Абонемент: #{sub['id']}\n"
         f"Период: {_format_date(start)} — {_format_date(end)} ({days} дней)\n"
         f"Причина: {reason_label}"
     )
@@ -1354,7 +1364,7 @@ async def submit_freeze(
     )
     await notify_admin(context, admin_msg, reply_markup=admin_keyboard)
 
-    text = "\u2705 Заявка отправлена. Ждём подтверждения."
+    text = "\u2705 Заявка на заморозку отправлена. Ждите подтверждения администратора."
     keyboard = [
         [InlineKeyboardButton("\U0001f519 В меню", callback_data="my_subscription")]
     ]
@@ -1379,7 +1389,7 @@ async def handle_freeze_approve(
         return
 
     Freeze.approve(freeze_id, admin["id"])
-    Subscription.increment_freeze_used(freeze["subscription_id"])
+    Subscription.update_freeze_used(freeze["subscription_id"], 1)
     logger.info("Админ %s одобрил заморозку %s", admin["id"], freeze_id)
 
     # Уведомляем клиента
@@ -1390,7 +1400,7 @@ async def handle_freeze_approve(
             await context.bot.send_message(
                 chat_id=client["telegram_id"],
                 text=(
-                    "\u2705 Заморозка подтверждена "
+                    "\u2705 Ваша заморозка подтверждена "
                     f"с {_format_date(freeze['start_date'])} "
                     f"по {_format_date(freeze['end_date'])}."
                 ),
@@ -1402,7 +1412,7 @@ async def handle_freeze_approve(
 
     # Обновляем сообщение в чате админа
     await query.edit_message_text(
-        "\u2705 Подтверждено\n\n"
+        "\u2705 Заморозка одобрена\n\n"
         f"\U0001f9ca {_format_date(freeze['start_date'])} — "
         f"{_format_date(freeze['end_date'])}"
     )
@@ -1435,7 +1445,7 @@ async def handle_freeze_reject(
         try:
             await context.bot.send_message(
                 chat_id=client["telegram_id"],
-                text="\u274c Заморозка отклонена.",
+                text="\u274c Администратор отклонил заморозку.",
             )
         except Exception as e:
             logger.error(
@@ -1443,14 +1453,14 @@ async def handle_freeze_reject(
             )
 
     await query.edit_message_text(
-        "\u274c Отклонено\n\n"
+        "\u274c Заморозка отклонена\n\n"
         f"\U0001f9ca {_format_date(freeze['start_date'])} — "
         f"{_format_date(freeze['end_date'])}"
     )
 
 
-async def handle_freeze_cancel_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Клиент подтверждает отмену активной заморозки."""
+async def show_sub_freeze_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена активной заморозки клиентом (срок абонемента не меняется)."""
     query = update.callback_query
     await safe_answer(query)
 
@@ -1467,7 +1477,7 @@ async def handle_freeze_cancel_yes(update: Update, context: ContextTypes.DEFAULT
         logger.info(
             "Пользователь %s отменил заморозку %s", user["id"], freeze["id"]
         )
-        text = "\u274c Заморозка отменена.\n\nСрок действия абонемента не изменился."
+        text = "\u274c Заморозка отменена."
 
     keyboard = [
         [InlineKeyboardButton("\U0001f519 В меню", callback_data="my_subscription")]
@@ -1505,10 +1515,9 @@ def check_and_complete_freeze(user_id: int) -> bool:
     Freeze.complete(freeze["id"], actual_end, days_actual)
     Subscription.extend_expires(sub["id"], days_actual)
     logger.info(
-        "Заморозка %s завершена автоматически: %s дней, expires продлён для абонемента %s",
-        freeze["id"],
-        days_actual,
+        "Заморозка завершена досрочно, абонемент %s продлен на %s дней",
         sub["id"],
+        days_actual,
     )
     return True
 
@@ -1573,42 +1582,6 @@ async def show_sub_buy_online(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         ],
         [InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")],
-    ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def show_sub_freeze_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена активной заморозки — запрос подтверждения."""
-    query = update.callback_query
-    await safe_answer(query)
-
-    user, sub = _get_user_and_active_sub(update)
-    if not user or not sub:
-        await query.edit_message_text("\u26a0\ufe0f Активный абонемент не найден.")
-        return
-
-    freeze = Freeze.get_active_for_subscription(sub["id"])
-    if not freeze:
-        text = "У вас нет активной заморозки."
-        keyboard = [
-            [InlineKeyboardButton("\U0001f519 В меню", callback_data="my_subscription")]
-        ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    text = (
-        "\u274c Отменить заморозку?\n\n"
-        f"Период: {_format_date(freeze['start_date'])} — "
-        f"{_format_date(freeze['end_date'])}\n\n"
-        "Срок действия абонемента при этом не изменится."
-    )
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "\u2705 Да, отменить", callback_data="freeze_cancel_yes"
-            )
-        ],
-        [InlineKeyboardButton("\U0001f519 Нет", callback_data="my_subscription")],
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -3398,11 +3371,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # Клиент: подтверждение заявки на заморозку
-    if data.startswith("freeze_confirm_"):
-        reason_key = data[len("freeze_confirm_"):]
-        if reason_key in FREEZE_REASONS:
-            await submit_freeze(update, context, reason_key)
-            return
+    if data == "freeze_confirm":
+        await submit_freeze(update, context)
+        return
 
     # Админ: одобрение/отклонение заявки (из чата администратора)
     if data.startswith("freeze_approve_"):
@@ -3417,11 +3388,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_freeze_reject(update, context, fid)
             return
 
-    # Клиент: подтверждение отмены заморозки
-    if data == "freeze_cancel_yes":
-        await handle_freeze_cancel_yes(update, context)
-        return
-
+    # --- Остальные пункты ---
     if data == "sub_buy_offline":
         await show_sub_buy_offline(update, context)
         return
