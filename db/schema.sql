@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     hours_total     DECIMAL(4,1) DEFAULT NULL COMMENT 'Всего часов, NULL для безлимита',
     hours_left      DECIMAL(4,1) DEFAULT NULL COMMENT 'Остаток часов, NULL для безлимита',
     freeze_used     INT UNSIGNED NOT NULL DEFAULT 0,
-    status          ENUM('active','frozen','expired','depleted') NOT NULL DEFAULT 'active',
+    status          ENUM('active','frozen','expired','depleted','cancelled') NOT NULL DEFAULT 'active',
     comment         TEXT DEFAULT NULL,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -155,7 +155,7 @@ CREATE TABLE IF NOT EXISTS visits (
     marked_by       INT UNSIGNED DEFAULT NULL COMMENT 'Кто отметил (users.id)',
     method          ENUM('qr','manual_teacher','manual_admin','self') NOT NULL DEFAULT 'qr',
     visit_type      ENUM('subscription','single','postpayment') NOT NULL DEFAULT 'subscription',
-    status          ENUM('present','absent','cancelled') NOT NULL DEFAULT 'present',
+    status          ENUM('present','absent','cancelled','attended') NOT NULL DEFAULT 'present',
     hours_charged   DECIMAL(4,1) DEFAULT NULL COMMENT 'Сколько часов списано фактически',
     comment         TEXT DEFAULT NULL,
 

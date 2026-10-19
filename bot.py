@@ -33,7 +33,9 @@ warnings.filterwarnings(
 from db.connection import get_connection
 from db.constants import CONSENT_TEXT, CONSENT_TEXT_VERSION
 from db.models import (
+    Booking,
     Freeze,
+    Group,
     Subscription,
     SubscriptionType,
     User,
@@ -72,6 +74,38 @@ def _format_date(value) -> str:
     return str(value)[:10]
 
 
+def _format_time(value) -> str:
+    """Форматирует время как ЧЧ:ММ (из timedelta/time/строки); None — «—»."""
+    if value is None:
+        return "—"
+    if hasattr(value, "strftime"):
+        return value.strftime("%H:%M")
+    # PyMySQL возвращает TIME как timedelta: str() может быть "9:30:00"
+    parts = str(value).split(":")
+    if len(parts) >= 2:
+        return f"{int(parts[0]):02d}:{parts[1]}"
+    return str(value)
+
+
+def _extract_int(data: str, prefix: str) -> Optional[int]:
+    """Достаёт число из суффикса callback-строки; None при неудаче."""
+    try:
+        return int(data[len(prefix):])
+    except (ValueError, IndexError):
+        return None
+
+
+def _extract_two_ints(data: str, prefix: str) -> Optional[tuple[int, int]]:
+    """Достаёт два числа, разделённых '_'; None при неудаче."""
+    parts = data[len(prefix):].split("_", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
     """Отправляет уведомление администратору (ADMIN_CHAT_ID из .env)."""
     if not ADMIN_CHAT_ID:
@@ -90,6 +124,9 @@ CONSENT, FULL_NAME, PHONE = range(3)
 
 # Состояния для диалога редактирования профиля
 PROFILE_FULL_NAME, PROFILE_PHONE = range(2)
+
+# Состояние диалога смены даты окончания абонемента (админка)
+ADMIN_SUB_EXPIRES_DATE = 10
 
 # Инициализируем FTS5 (база знаний) при старте
 sync_knowledge()
@@ -1006,9 +1043,11 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Безлимит
         lines.append("\u23f3 Безлимит")
     else:
-        n_one = math.floor(hours_left / 1.0)
-        n_half = math.floor(hours_left / 1.5)
-        lines.append(f"Осталось: {hours_left} часов")
+        # DECIMAL из MySQL приходит как Decimal — перед математикой приводим к float
+        hours_left_f = float(hours_left)
+        n_one = math.floor(hours_left_f / 1.0)
+        n_half = math.floor(hours_left_f / 1.5)
+        lines.append(f"Осталось: {hours_left_f} часов")
         lines.append(f"≈ {n_one} занятий по 1ч или {n_half} по 1.5ч")
 
     expires_at = sub.get("expires_at")
@@ -1857,6 +1896,29 @@ async def _require_admin(
     return user
 
 
+async def _require_teacher(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> Optional[dict]:
+    """
+    Проверяет, что пользователь — teacher (или admin/super_admin).
+    Возвращает dict пользователя или None (и показывает alert).
+    """
+    query = update.callback_query
+    user = User.get_by_telegram_id(update.effective_user.id)
+    if not user:
+        await safe_answer(query, "Не зарегистрирован", show_alert=True)
+        return None
+    roles = UserRole.get_active_roles(user["id"])
+    if (
+        "teacher" not in roles
+        and "admin" not in roles
+        and "super_admin" not in roles
+    ):
+        await safe_answer(query, "Нет доступа", show_alert=True)
+        return None
+    return user
+
+
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главное меню админ-панели."""
     user = await _require_admin(update, context)
@@ -2151,6 +2213,678 @@ async def show_admin_role_revoke(
 
 
 # ----------------------------------------------------------------------
+# Админка: абонементы пользователей
+# ----------------------------------------------------------------------
+
+# Человекочитаемые подписи статусов абонемента для админки
+ADMIN_SUB_STATUS_LABELS = {
+    "active": "\U0001f7e2 Активный",
+    "frozen": "\U0001f9ca Заморожен",
+    "expired": "\U0001f534 Сгорел",
+    "depleted": "\U0001f534 Завершён",
+    "cancelled": "\U0001f534 Отменён",
+}
+
+
+async def show_admin_user_subs(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    notice: str = None,
+):
+    """Экран «Абонементы пользователя» (только admin/super_admin)."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+
+    query = update.callback_query
+    user = User.get_by_id(user_id)
+    if not user:
+        await safe_answer(query, "Пользователь не найден", show_alert=True)
+        return
+
+    subs = Subscription.get_for_user(user_id)
+    types = {t["id"]: t for t in SubscriptionType.get_all()}
+
+    lines = [f"\U0001f4b0 Абонементы: {user['full_name'] or user['username'] or user_id}"]
+    keyboard = []
+
+    # Активный абонемент (для него — кнопка управления)
+    active = [s for s in subs if s["status"] == "active"]
+    if active:
+        s = active[0]
+        sub_type = types.get(s.get("type_id")) or {}
+        type_name = sub_type.get("name") or "—"
+        hours_left = s.get("hours_left")
+        hours_str = f"{hours_left}ч" if hours_left is not None else "безлимит"
+        lines.append("")
+        lines.append("\U0001f7e2 Активный:")
+        lines.append(
+            f"#{s['id']} · {type_name} · Осталось: {hours_str} · "
+            f"До: {_format_date(s.get('expires_at'))}"
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\u270f\ufe0f Управление абонементом",
+                    callback_data=f"admin_sub_manage_{s['id']}",
+                )
+            ]
+        )
+    else:
+        lines.append("")
+        lines.append("\U0001f7e2 Активный: нет.")
+
+    # Архив (неактивные абонементы)
+    archived = [s for s in subs if s["status"] != "active"]
+    if archived:
+        lines.append("")
+        lines.append("\U0001f534 Архив:")
+        for s in archived:
+            sub_type = types.get(s.get("type_id")) or {}
+            type_name = sub_type.get("name") or "—"
+            label = ADMIN_SUB_STATUS_LABELS.get(s["status"], s["status"])
+            lines.append(
+                f"#{s['id']} · {type_name} · {label} {_format_date(s.get('expires_at'))}"
+            )
+
+    text = "\n".join(lines)
+    if notice:
+        text = f"{notice}\n\n{text}"
+
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "\u2795 Выдать новый абонемент",
+                callback_data=f"admin_sub_create_{user_id}",
+            )
+        ]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "\U0001f519 К карточке юзера",
+                callback_data=f"admin_user_{user_id}",
+            )
+        ]
+    )
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def admin_sub_create_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """Выдача нового абонемента — список тарифов на выбор."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    user = User.get_by_id(user_id)
+    if not user:
+        await safe_answer(query, "Пользователь не найден", show_alert=True)
+        return
+
+    types = SubscriptionType.get_active()
+    if not types:
+        await query.edit_message_text("Нет доступных тарифов.")
+        return
+
+    text = (
+        f"\U0001f4b0 Выдача абонемента: "
+        f"{user['full_name'] or user['username'] or user_id}\n\n"
+        "Выберите тариф:"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"{t['name']} ({t['price_byn']} BYN)",
+                callback_data=f"admin_sub_type_{user_id}_{t['id']}",
+            )
+        ]
+        for t in types
+    ]
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад", callback_data=f"admin_user_subs_{user_id}"
+            )
+        ]
+    )
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def admin_sub_type_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, type_id: int
+):
+    """Создание абонемента выбранного типа (шаг после выбора тарифа)."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    user = User.get_by_id(user_id)
+    sub_type = SubscriptionType.get_by_id(type_id)
+    if not user or not sub_type:
+        await safe_answer(query, "Данные не найдены", show_alert=True)
+        return
+
+    now = datetime.now()
+    hours = sub_type.get("hours_count")  # None — для безлимита
+    expires_at = now + timedelta(days=sub_type["duration_days"] or 30)
+
+    Subscription.create(
+        user_id=user_id,
+        type_id=type_id,
+        purchased_at=now,
+        started_at=now,
+        expires_at=expires_at,
+        hours_total=hours,
+        hours_left=hours,
+        status="active",
+    )
+    logger.info(
+        "Админ %s выдал абонемент %s (type_id=%s) клиенту %s",
+        admin["id"],
+        sub_type["name"],
+        type_id,
+        user_id,
+    )
+
+    # Возвращаемся к списку абонементов с уведомлением о выдаче
+    notice = (
+        f"\u2705 Абонемент {sub_type['name']} выдан клиенту "
+        f"{user['full_name'] or user_id}"
+    )
+    await show_admin_user_subs(update, context, user_id, notice=notice)
+
+
+async def show_admin_sub_manage(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    sub_id: int,
+    notice: str = None,
+):
+    """Экран управления конкретным абонементом (dual-mode: кнопка/сообщение)."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    sub = Subscription.get_by_id(sub_id)
+    if not sub:
+        if query:
+            await safe_answer(query, "Абонемент не найден", show_alert=True)
+        else:
+            await update.message.reply_text("Абонемент не найден.")
+        return
+
+    sub_type = SubscriptionType.get_by_id(sub["type_id"]) if sub.get("type_id") else None
+    type_name = sub_type["name"] if sub_type else "Абонемент"
+
+    hours_left = sub.get("hours_left")
+    hours_total = sub.get("hours_total")
+    left_str = f"{hours_left}ч" if hours_left is not None else "безлимит"
+    total_str = f"{hours_total}ч" if hours_total is not None else "безлимит"
+
+    text = (
+        f"\u2699\ufe0f Управление: {type_name}\n"
+        f"Осталось: {left_str} из {total_str}\n"
+        f"Действует до: {_format_date(sub.get('expires_at'))}"
+    )
+    if notice:
+        text = f"{notice}\n\n{text}"
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\u2795 Добавить 1ч", callback_data=f"admin_sub_add_hours_{sub_id}"
+            ),
+            InlineKeyboardButton(
+                "\u2796 Списать 1ч", callback_data=f"admin_sub_sub_hours_{sub_id}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 Изменить дату окончания",
+                callback_data=f"admin_sub_expires_{sub_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\u2705 Отметить посещение",
+                callback_data=f"admin_sub_visit_{sub_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\u274c Отменить абонемент",
+                callback_data=f"admin_sub_cancel_{sub_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад",
+                callback_data=f"admin_user_subs_{sub['user_id']}",
+            )
+        ],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup)
+
+
+async def handle_sub_add_hours(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
+):
+    """Быстрое добавление 1 часа к абонементу."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    if Subscription.update_hours(sub_id, 1.0):
+        logger.info("Админ %s добавил 1ч абонементу %s", admin["id"], sub_id)
+    await show_admin_sub_manage(update, context, sub_id)
+
+
+async def handle_sub_sub_hours(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
+):
+    """Быстрое списание 1 часа (не ниже 0)."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    if Subscription.update_hours(sub_id, -1.0):
+        logger.info("Админ %s списал 1ч с абонемента %s", admin["id"], sub_id)
+    await show_admin_sub_manage(update, context, sub_id)
+
+
+async def admin_sub_expires_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1 — запрос новой даты окончания (ConversationHandler)."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return ConversationHandler.END
+    query = update.callback_query
+
+    # ConversationHandler вызывает обработчик только с (update, context) —
+    # ID абонемента достаём из callback_data
+    try:
+        sub_id = int(query.data.replace("admin_sub_expires_", ""))
+    except (ValueError, AttributeError):
+        await query.edit_message_text("Ошибка: неверный ID абонемента.")
+        return ConversationHandler.END
+
+    sub = Subscription.get_by_id(sub_id)
+    if not sub:
+        await safe_answer(query, "Абонемент не найден", show_alert=True)
+        return ConversationHandler.END
+
+    context.user_data["admin_sub_id"] = sub_id
+    text = (
+        f"\U0001f4c5 Текущая дата: {_format_date(sub.get('expires_at'))}.\n\n"
+        "Введите новую дату в формате ДД.ММ.ГГГГ:"
+    )
+    keyboard = [
+        [InlineKeyboardButton("\U0001f519 Отмена", callback_data="admin_sub_expires_cancel")]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return ADMIN_SUB_EXPIRES_DATE
+
+
+async def admin_sub_expires_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2 — валидация даты и обновление expires_at."""
+    text = update.message.text.strip()
+    try:
+        new_expires = datetime.strptime(text, "%d.%m.%Y")
+    except ValueError:
+        await update.message.reply_text(
+            "\u26a0\ufe0f Неверный формат. Введите дату как ДД.ММ.ГГГГ "
+            "(например, 25.12.2026):"
+        )
+        return ADMIN_SUB_EXPIRES_DATE
+
+    if new_expires <= datetime.now():
+        await update.message.reply_text(
+            "\u26a0\ufe0f Дата должна быть в будущем. Введите ещё раз:"
+        )
+        return ADMIN_SUB_EXPIRES_DATE
+
+    sub_id = context.user_data.get("admin_sub_id")
+    context.user_data.pop("admin_sub_id", None)
+    if not sub_id:
+        await update.message.reply_text("Диалог устарел. Откройте управление заново.")
+        return ConversationHandler.END
+
+    sub = Subscription.get_by_id(sub_id)
+    if not sub:
+        await update.message.reply_text("Абонемент не найден.")
+        return ConversationHandler.END
+
+    Subscription.update_expires(sub_id, new_expires)
+    logger.info(
+        "Админ %s изменил дату окончания абонемента %s на %s",
+        update.effective_user.id,
+        sub_id,
+        _format_date(new_expires),
+    )
+
+    # Опционально — уведомляем клиента о продлении
+    client = User.get_by_id(sub["user_id"])
+    if client and client.get("telegram_id"):
+        try:
+            await context.bot.send_message(
+                chat_id=client["telegram_id"],
+                text=f"\u2705 Ваш абонемент продлён до {_format_date(new_expires)}.",
+            )
+        except Exception as e:
+            logger.error(
+                "Не удалось уведомить клиента %s: %s", client["telegram_id"], e
+            )
+
+    await update.message.reply_text(
+        f"\u2705 Дата окончания обновлена: {_format_date(new_expires)}."
+    )
+    # Возвращаем экран управления абонементом
+    await show_admin_sub_manage(update, context, sub_id)
+    return ConversationHandler.END
+
+
+async def admin_sub_expires_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена смены даты (кнопка или /cancel) — возврат к экрану управления."""
+    sub_id = context.user_data.get("admin_sub_id")
+    context.user_data.pop("admin_sub_id", None)
+
+    if update.callback_query:
+        await safe_answer(update.callback_query)
+        await update.callback_query.edit_message_text(
+            "\U0001f4c5 Изменение даты отменено."
+        )
+    else:
+        await update.message.reply_text("\U0001f4c5 Изменение даты отменено.")
+
+    if sub_id:
+        await show_admin_sub_manage(update, context, sub_id)
+    return ConversationHandler.END
+
+
+async def admin_sub_visit_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
+):
+    """Отметка посещения — запрос количества часов для списания."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    sub = Subscription.get_by_id(sub_id)
+    if not sub:
+        await safe_answer(query, "Абонемент не найден", show_alert=True)
+        return
+
+    text = "\u2705 Отметка посещения\n\nСколько часов списать?"
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "1 ч", callback_data=f"admin_sub_visit_hours_{sub_id}_1"
+            ),
+            InlineKeyboardButton(
+                "1.5 ч", callback_data=f"admin_sub_visit_hours_{sub_id}_1.5"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад", callback_data=f"admin_sub_manage_{sub_id}"
+            )
+        ],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def admin_sub_visit_hours_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int, hours: float
+):
+    """Списание часов и создание записи посещения."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    sub = Subscription.get_by_id(sub_id)
+    if not sub:
+        await safe_answer(query, "Абонемент не найден", show_alert=True)
+        return
+
+    if not Subscription.update_hours(sub_id, -hours):
+        await safe_answer(query, "Не удалось списать часы", show_alert=True)
+        return
+
+    # Ручная отметка посещения админом (без события из EM)
+    Visit.create(
+        user_id=sub["user_id"],
+        em_event_id=0,
+        subscription_id=sub_id,
+        marked_at=datetime.now(),
+        marked_by=admin["id"],
+        method="manual_admin",
+        visit_type="subscription",
+        status="attended",
+        hours_charged=hours,
+    )
+    logger.info(
+        "Админ %s отметил посещение абонементу %s: %sч",
+        admin["id"],
+        sub_id,
+        hours,
+    )
+
+    remaining = Subscription.get_by_id(sub_id).get("hours_left")
+    remaining_str = f"{remaining}ч" if remaining is not None else "безлимит"
+    notice = f"\u2705 Посещение отмечено. Списано {hours}ч. Осталось {remaining_str}"
+    await show_admin_sub_manage(update, context, sub_id, notice=notice)
+
+
+async def admin_sub_cancel_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
+):
+    """Подтверждение отмены абонемента."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    sub = Subscription.get_by_id(sub_id)
+    if not sub:
+        await safe_answer(query, "Абонемент не найден", show_alert=True)
+        return
+
+    hours_left = sub.get("hours_left")
+    left_str = f"{hours_left}ч" if hours_left is not None else "безлимит"
+    text = f"\u274c Отменить абонемент?\n\nОстаток {left_str} сгорит."
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\u2705 Да, отменить",
+                callback_data=f"admin_sub_cancel_yes_{sub_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Нет", callback_data=f"admin_sub_manage_{sub_id}"
+            )
+        ],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def admin_sub_cancel_yes_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
+):
+    """Фактическая отмена абонемента."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+
+    sub = Subscription.get_by_id(sub_id)
+    if not sub:
+        await safe_answer(update.callback_query, "Абонемент не найден", show_alert=True)
+        return
+
+    Subscription.set_status(sub_id, "cancelled")
+    logger.info("Админ %s отменил абонемент %s", admin["id"], sub_id)
+    # Возвращаемся к списку абонементов пользователя
+    await show_admin_user_subs(update, context, sub["user_id"])
+
+
+# ----------------------------------------------------------------------
+# Панель преподавателя
+# ----------------------------------------------------------------------
+async def show_teacher_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главное меню панели преподавателя."""
+    teacher = await _require_teacher(update, context)
+    if not teacher:
+        return
+    query = update.callback_query
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 Мои занятия сегодня", callback_data="teacher_today"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 Расписание на неделю", callback_data="teacher_week"
+            )
+        ],
+        [InlineKeyboardButton("\U0001f519 Главное меню", callback_data="back_to_main")],
+    ]
+    await query.edit_message_text(
+        "\U0001f9d1\u200d\U0001f3eb Панель преподавателя",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def show_teacher_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Слоты преподавателя на текущий день недели."""
+    teacher = await _require_teacher(update, context)
+    if not teacher:
+        return
+    query = update.callback_query
+
+    # date.isoweekday(): 1=Пн ... 7=Вс — совпадает с форматом weekdays в БД
+    weekday = date.today().isoweekday()
+
+    # Слоты преподавателя, отфильтрованные по дню недели
+    today_slots = []
+    for slot in Group.get_by_teacher(teacher["id"]):
+        days = [
+            d.strip()
+            for d in (slot.get("weekdays") or "").split(",")
+            if d.strip()
+        ]
+        if str(weekday) in days:
+            today_slots.append(slot)
+
+    if not today_slots:
+        text = "\U0001f4c5 Мои занятия сегодня\n\nУ вас нет занятий сегодня."
+        keyboard = [
+            [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_panel")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    lines = ["\U0001f4c5 Мои занятия сегодня", ""]
+    keyboard = []
+    for slot in today_slots:
+        time_str = _format_time(slot.get("time_start"))
+        name = slot.get("name") or slot.get("category_slug") or "Занятие"
+        location = slot.get("location_id") or "—"
+
+        # Пока слоты не связаны с событиями EM — количество записей недоступно
+        em_event_id = slot.get("em_event_id")
+        if em_event_id:
+            count = Booking.count_confirmed_for_event(em_event_id)
+            count_str = f"{count} чел."
+        else:
+            count_str = "—"
+
+        lines.append(f"\U0001f555 {time_str} — {name} (Зал {location})")
+        lines.append(f"Записано: {count_str}")
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f465 Список",
+                    callback_data=f"teacher_slot_{slot['id']}",
+                )
+            ]
+        )
+
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_panel")]
+    )
+    await query.edit_message_text(
+        "\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def show_teacher_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Расписание преподавателя на неделю — заглушка."""
+    teacher = await _require_teacher(update, context)
+    if not teacher:
+        return
+    query = update.callback_query
+
+    text = "\U0001f4c5 Расписание на неделю будет доступно позже."
+    keyboard = [
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_panel")]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_teacher_slot(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, slot_id: int
+):
+    """Список записавшихся на слот (заглушка до интеграции с EM)."""
+    teacher = await _require_teacher(update, context)
+    if not teacher:
+        return
+    query = update.callback_query
+
+    slot = Group.get_by_id(slot_id)
+    if not slot:
+        await safe_answer(query, "Слот не найден", show_alert=True)
+        return
+
+    # Если у слота появится привязка к событию EM — покажем реальные записи
+    em_event_id = slot.get("em_event_id")
+    if em_event_id:
+        bookings = Booking.get_by_event(em_event_id)
+        if bookings:
+            lines = ["\U0001f465 Записи на занятие", ""]
+            for b in bookings:
+                who = b.get("full_name") or b.get("username") or f"ID {b.get('user_id')}"
+                lines.append(f"• {who}")
+            text = "\n".join(lines)
+            keyboard = [
+                [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_today")]
+            ]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+
+    text = (
+        "\U0001f465 Записи на занятие\n\n"
+        "Интеграция со списком записей появится позже. Пока вы можете "
+        "отметить посещение вручную."
+    )
+    keyboard = [
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_today")]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ----------------------------------------------------------------------
 # Обработчик инлайн-кнопок (все, кроме book, который перехватывается
 # ConversationHandler)
 # ----------------------------------------------------------------------
@@ -2333,6 +3067,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (ValueError, IndexError):
             pass
 
+    # Абонементы пользователя — проверяем ДО admin_user_
+    if data.startswith("admin_user_subs_"):
+        uid = _extract_int(data, "admin_user_subs_")
+        if uid is not None:
+            await show_admin_user_subs(update, context, uid)
+            return
+
     # Карточка пользователя
     if data.startswith("admin_user_"):
         try:
@@ -2367,6 +3108,98 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             except ValueError:
                 pass
+
+    # --- Абонементы: экран управления (админка) ---
+    if data.startswith("admin_sub_manage_"):
+        sid = _extract_int(data, "admin_sub_manage_")
+        if sid is not None:
+            await show_admin_sub_manage(update, context, sid)
+            return
+
+    # Выдача нового абонемента: выбор тарифа
+    if data.startswith("admin_sub_create_"):
+        uid = _extract_int(data, "admin_sub_create_")
+        if uid is not None:
+            await admin_sub_create_handler(update, context, uid)
+            return
+
+    # Выдача нового абонемента: подтверждение созданием
+    if data.startswith("admin_sub_type_"):
+        parsed = _extract_two_ints(data, "admin_sub_type_")
+        if parsed:
+            uid, tid = parsed
+            await admin_sub_type_handler(update, context, uid, tid)
+            return
+
+    # Быстрое изменение часов
+    if data.startswith("admin_sub_add_hours_"):
+        sid = _extract_int(data, "admin_sub_add_hours_")
+        if sid is not None:
+            await handle_sub_add_hours(update, context, sid)
+            return
+
+    if data.startswith("admin_sub_sub_hours_"):
+        sid = _extract_int(data, "admin_sub_sub_hours_")
+        if sid is not None:
+            await handle_sub_sub_hours(update, context, sid)
+            return
+
+    # Смена даты окончания (обычно перехватывает ConversationHandler)
+    if data.startswith("admin_sub_expires_"):
+        sid = _extract_int(data, "admin_sub_expires_")
+        if sid is not None:
+            await admin_sub_expires_handler(update, context)
+            return
+
+    # Отметка посещения: выбор часов (1 / 1.5)
+    if data.startswith("admin_sub_visit_hours_"):
+        parts = data[len("admin_sub_visit_hours_"):].split("_", 1)
+        if len(parts) == 2:
+            try:
+                sid = int(parts[0])
+                hours = float(parts[1])
+                await admin_sub_visit_hours_handler(update, context, sid, hours)
+                return
+            except ValueError:
+                pass
+
+    if data.startswith("admin_sub_visit_"):
+        sid = _extract_int(data, "admin_sub_visit_")
+        if sid is not None:
+            await admin_sub_visit_handler(update, context, sid)
+            return
+
+    # Отмена абонемента (сначала — подтверждение, затем — исполнение)
+    if data.startswith("admin_sub_cancel_yes_"):
+        sid = _extract_int(data, "admin_sub_cancel_yes_")
+        if sid is not None:
+            await admin_sub_cancel_yes_handler(update, context, sid)
+            return
+
+    if data.startswith("admin_sub_cancel_"):
+        sid = _extract_int(data, "admin_sub_cancel_")
+        if sid is not None:
+            await admin_sub_cancel_handler(update, context, sid)
+            return
+
+    # --- Панель преподавателя ---
+    if data == "teacher_panel":
+        await show_teacher_panel(update, context)
+        return
+
+    if data == "teacher_today":
+        await show_teacher_today(update, context)
+        return
+
+    if data == "teacher_week":
+        await show_teacher_week(update, context)
+        return
+
+    if data.startswith("teacher_slot_"):
+        slot_id = _extract_int(data, "teacher_slot_")
+        if slot_id is not None:
+            await show_teacher_slot(update, context, slot_id)
+            return
 
     # --- Остальные пункты ---
     if data == "prices":
@@ -2448,6 +3281,22 @@ def main():
         fallbacks=[CommandHandler("cancel", profile_cancel)],
     )
 
+    # ConversationHandler смены даты окончания абонемента (админка)
+    admin_sub_expires_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_sub_expires_handler, pattern=r"^admin_sub_expires_\d+$")
+        ],
+        states={
+            ADMIN_SUB_EXPIRES_DATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_sub_expires_date),
+                CallbackQueryHandler(
+                    admin_sub_expires_cancel, pattern=r"^admin_sub_expires_cancel$"
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin_sub_expires_cancel)],
+    )
+
     # -----------------------------------------------------------------------
     # Error handler — логирует необработанные исключения
     # -----------------------------------------------------------------------
@@ -2465,6 +3314,7 @@ def main():
     application.add_handler(CommandHandler("ask", ask_handler))
     application.add_handler(book_conv)
     application.add_handler(profile_conv)
+    application.add_handler(admin_sub_expires_conv)
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
     )

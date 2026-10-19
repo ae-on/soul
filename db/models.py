@@ -6,6 +6,7 @@
 """
 
 import logging
+from datetime import datetime
 from typing import Any, Optional
 
 import pymysql
@@ -258,6 +259,28 @@ class User(BaseModel):
 class SubscriptionType(BaseModel):
     TABLE = "subscription_types"
 
+    @classmethod
+    def get_active(cls) -> list[dict]:
+        """Все активные типы абонементов, по sort_order."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM subscription_types
+                       WHERE active = 1
+                       ORDER BY sort_order, id"""
+                )
+                return cur.fetchall()
+
+    @classmethod
+    def get_all(cls) -> list[dict]:
+        """Все типы абонементов (включая неактивные), по sort_order."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM subscription_types ORDER BY sort_order, id"
+                )
+                return cur.fetchall()
+
 
 class Subscription(BaseModel):
     TABLE = "subscriptions"
@@ -303,7 +326,8 @@ class Subscription(BaseModel):
                 if row["hours_left"] is None:
                     # Безлимит — списываем без проверки
                     return True
-                if row["hours_left"] < hours:
+                # DECIMAL из MySQL приходит как Decimal — приводим к float
+                if float(row["hours_left"]) < hours:
                     return False
                 cur.execute(
                     "UPDATE subscriptions SET hours_left = hours_left - %s WHERE id = %s",
@@ -360,6 +384,87 @@ class Subscription(BaseModel):
                     logger.info(
                         "Абонемент %s продлён на %s дней", subscription_id, days
                     )
+                return ok
+
+    @classmethod
+    def get_for_user(cls, user_id: int) -> list[dict]:
+        """Все абонементы пользователя, новые сверху (для админки)."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM subscriptions
+                       WHERE user_id = %s
+                       ORDER BY created_at DESC""",
+                    (user_id,),
+                )
+                return cur.fetchall()
+
+    @classmethod
+    def update_hours(cls, sub_id: int, delta: float) -> bool:
+        """
+        Изменить hours_left на delta (не ниже 0).
+        Для безлимита (hours_left IS NULL) — ничего не меняем, True.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    "SELECT hours_left FROM subscriptions WHERE id = %s",
+                    (sub_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False
+                if row["hours_left"] is None:
+                    # Безлимит — часы не списываются и не добавляются
+                    return True
+                # DECIMAL из MySQL приходит как Decimal — приводим к float
+                current_hours = float(row["hours_left"])
+                new_value = max(0.0, current_hours + delta)
+                cur.execute(
+                    "UPDATE subscriptions SET hours_left = %s WHERE id = %s",
+                    (new_value, sub_id),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info(
+                        "Абонемент %s: hours_left %s -> %s",
+                        sub_id,
+                        row["hours_left"],
+                        new_value,
+                    )
+                return ok
+
+    @classmethod
+    def update_expires(cls, sub_id: int, new_expires: datetime) -> bool:
+        """Обновить expires_at (new_expires — datetime)."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE subscriptions SET expires_at = %s WHERE id = %s",
+                    (new_expires, sub_id),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info(
+                        "Абонемент %s: expires_at -> %s", sub_id, new_expires
+                    )
+                return ok
+
+    @classmethod
+    def set_status(cls, sub_id: int, status: str) -> bool:
+        """Обновить статус абонемента (active/frozen/expired/depleted/cancelled)."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE subscriptions SET status = %s WHERE id = %s",
+                    (status, sub_id),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info("Абонемент %s: статус -> %s", sub_id, status)
                 return ok
 
 
@@ -667,7 +772,7 @@ class Group(BaseModel):
         with get_connection() as conn:
             with conn.cursor(DictCursor) as cur:
                 cur.execute(
-                    "SELECT * FROM groups WHERE active = 1 ORDER BY category_slug, time_start"
+                    f"SELECT * FROM {cls.TABLE} WHERE active = 1 ORDER BY category_slug, time_start"
                 )
                 return cur.fetchall()
 
@@ -677,7 +782,7 @@ class Group(BaseModel):
         with get_connection() as conn:
             with conn.cursor(DictCursor) as cur:
                 cur.execute(
-                    "SELECT * FROM groups WHERE teacher_id = %s AND active = 1 ORDER BY time_start",
+                    f"SELECT * FROM {cls.TABLE} WHERE teacher_id = %s AND active = 1 ORDER BY time_start",
                     (teacher_id,),
                 )
                 return cur.fetchall()
@@ -688,7 +793,7 @@ class Group(BaseModel):
         with get_connection() as conn:
             with conn.cursor(DictCursor) as cur:
                 cur.execute(
-                    "SELECT * FROM groups WHERE category_slug = %s AND active = 1 ORDER BY time_start",
+                    f"SELECT * FROM {cls.TABLE} WHERE category_slug = %s AND active = 1 ORDER BY time_start",
                     (category_slug,),
                 )
                 return cur.fetchall()
@@ -703,7 +808,7 @@ class Group(BaseModel):
         with get_connection() as conn:
             with conn.cursor(DictCursor) as cur:
                 cur.execute(
-                    """SELECT * FROM groups
+                    f"""SELECT * FROM {cls.TABLE}
                        WHERE active = 1
                          AND FIND_IN_SET(%s, weekdays) > 0
                        ORDER BY time_start""",
