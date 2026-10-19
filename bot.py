@@ -1044,8 +1044,11 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         f"\U0001f4ca {type_name}",
     ]
     if hours_left is None:
-        # Безлимит
-        lines.append("\u23f3 Безлимит")
+        # NULL допустим только у безлимитного тарифа; иначе — ошибка данных
+        if sub_type and "безлимит" in (sub_type.get("name") or "").lower():
+            lines.append("\u23f3 Безлимит")
+        else:
+            lines.append("\u23f3 Осталось: 0ч (ошибка данных)")
     else:
         # DECIMAL из MySQL приходит как Decimal — перед математикой приводим к float
         hours_left_f = float(hours_left)
@@ -2706,7 +2709,15 @@ async def admin_sub_type_handler(
         return
 
     now = datetime.now()
-    hours = sub_type.get("hours_count")  # None — для безлимита
+    # NULL допустим только у безлимитного тарифа; иначе — ошибка данных
+    hours = sub_type.get("hours_count")
+    if hours is not None:
+        hours = float(hours)
+    elif "безлимит" not in (sub_type.get("name") or "").lower():
+        await safe_answer(
+            query, "Ошибка: у тарифа не указано количество часов", show_alert=True
+        )
+        return
     expires_at = now + timedelta(days=sub_type["duration_days"] or 30)
 
     Subscription.create(
@@ -2758,12 +2769,15 @@ async def show_admin_sub_manage(
     sub_type = SubscriptionType.get_by_id(sub["type_id"]) if sub.get("type_id") else None
     type_name = sub_type["name"] if sub_type else "Абонемент"
 
-    hours_total = sub.get("hours_total")
-    if hours_total is None:
-        # Безлимитный абонемент
-        hours_line = "Осталось: Безлимит"
+    hours_left = sub.get("hours_left")
+    if hours_left is None:
+        # NULL допустим только у безлимитного тарифа; иначе — ошибка данных
+        if sub_type and "безлимит" in (sub_type.get("name") or "").lower():
+            hours_line = "Осталось: Безлимит"
+        else:
+            hours_line = "Осталось: 0ч (ошибка данных)"
     else:
-        hours_left = sub.get("hours_left")
+        hours_total = sub.get("hours_total")
         hours_line = f"Осталось: {hours_left}ч из {hours_total}ч"
 
     text = (
