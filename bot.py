@@ -1402,9 +1402,8 @@ async def show_sub_freeze_cancel(update: Update, context: ContextTypes.DEFAULT_T
 def check_and_complete_freeze(user_id: int) -> bool:
     """
     Автозавершение активной заморозки при возврате клиента.
-    Фиксирует фактическую дату окончания и продлевает expires_at.
+    Использует единую complete_and_revert: корректирует срок, сбрасывает freeze_used.
     Вызывается на /start и при отметке посещения.
-    Возвращает True, если заморозка завершена.
     """
     sub = Subscription.get_active_for_user(user_id)
     if not sub:
@@ -1414,33 +1413,7 @@ def check_and_complete_freeze(user_id: int) -> bool:
     if not freeze:
         return False
 
-    today = date.today()
-    start = freeze["start_date"]
-    if isinstance(start, datetime):
-        start = start.date()
-
-    # Фактические дни заморозки: от начала до сегодня (не больше запланированных)
-    freeze_days = freeze.get("days") or 0
-    days_actual = max(0, min((today - start).days, freeze_days))
-
-    Freeze.complete(freeze["id"], today, days_actual)
-    # Админская заморозка уже продлила срок при создании — не добавляем повторно.
-    # Клиентскую продлеваем на фактическое число дней.
-    if (freeze.get("reason") or "") == "По решению админа":
-        logger.info(
-            "Заморозка %s завершена (админская), абонемент %s: срок уже был продлён",
-            freeze["id"],
-            sub["id"],
-        )
-    else:
-        if days_actual > 0:
-            Subscription.add_days(sub["id"], days_actual)
-        logger.info(
-            "Заморозка завершена, абонемент %s: добавлено %s из %s дней",
-            sub["id"],
-            days_actual,
-            freeze_days,
-        )
+    Freeze.complete_and_revert(freeze["id"], date.today())
     return True
 
 
@@ -3565,42 +3538,9 @@ async def handle_admin_sub_unfreeze(
         await safe_answer(query, "Активная заморозка не найдена", show_alert=True)
         return
 
-    # Завершаем сегодняшним днём
-    today = date.today()
-    start = freeze["start_date"]
-    if isinstance(start, datetime):
-        start = start.date()
-
-    freeze_days = freeze.get("days") or 0
-    elapsed = max(0, (today - start).days)
-
-    Freeze.complete(freeze["id"], today, elapsed)
-
-    # Админская заморозка продлила срок при создании — возвращаем неиспользованные дни.
-    # Клиентская (без продления при создании) — добавляем фактически использованные.
-    if (freeze.get("reason") or "") == "По решению админа":
-        unused = freeze_days - elapsed
-        if unused > 0:
-            Subscription.extend_expires(sub_id, -unused)
-        logger.info(
-            "Админ %s снял заморозку %s (абонемент %s): использовано %s из %s дней, возвращено %s",
-            admin["id"],
-            freeze["id"],
-            sub_id,
-            elapsed,
-            freeze_days,
-            max(0, unused),
-        )
-    else:
-        if elapsed > 0:
-            Subscription.add_days(sub_id, elapsed)
-        logger.info(
-            "Админ %s снял клиентскую заморозку %s (абонемент %s): добавлено %s дней",
-            admin["id"],
-            freeze["id"],
-            sub_id,
-            elapsed,
-        )
+    # Завершаем заморозку единой функцией: корректировка срока + сброс freeze_used
+    Freeze.complete_and_revert(freeze["id"], date.today())
+    logger.info("Админ %s снял заморозку %s", admin["id"], freeze["id"])
 
     # Уведомляем клиента
     sub = Subscription.get_by_id(sub_id)

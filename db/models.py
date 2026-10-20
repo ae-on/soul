@@ -845,6 +845,84 @@ class Freeze(BaseModel):
                     )
                 return ok
 
+    @classmethod
+    def complete_and_revert(cls, freeze_id: int, actual_end_date) -> bool:
+        """
+        Завершить заморозку: зафиксировать фактические дни,
+        скорректировать срок абонемента (вычесть неиспользованные —
+        для админских, добавить фактические — для клиентских),
+        сбросить freeze_used.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute("SELECT * FROM freezes WHERE id = %s", (freeze_id,))
+                freeze = cur.fetchone()
+                if not freeze or freeze["status"] in ("completed", "cancelled"):
+                    return False
+
+                start = freeze["start_date"]
+                if isinstance(start, datetime):
+                    start = start.date()
+                if isinstance(actual_end_date, datetime):
+                    actual_end_date = actual_end_date.date()
+
+                days_actual = max(0, (actual_end_date - start).days)
+                freeze_days = freeze.get("days") or 0
+
+                # Обновляем заморозку
+                cur.execute(
+                    """UPDATE freezes
+                       SET status = 'completed',
+                           actual_end_date = %s,
+                           days_actual = %s
+                       WHERE id = %s""",
+                    (actual_end_date, days_actual, freeze_id),
+                )
+
+                sub_id = freeze["subscription_id"]
+                reason = freeze.get("reason") or ""
+                admin_reasons = ("По решению админа", "Быстрая заморозка", "Кастомная заморозка")
+                is_admin = any(r in reason for r in admin_reasons)
+
+                if is_admin:
+                    # Админская заморозка — срок продлён при создании;
+                    # вычитаем неиспользованные дни
+                    remaining = freeze_days - days_actual
+                    if remaining > 0:
+                        cur.execute(
+                            """UPDATE subscriptions
+                               SET expires_at = DATE_ADD(expires_at, INTERVAL -%s DAY)
+                               WHERE id = %s""",
+                            (remaining, sub_id),
+                        )
+                    log_msg = f"админская, вычтено {max(0, remaining)} из {freeze_days}"
+                else:
+                    # Клиентская — срок не продлевался; добавляем фактические дни
+                    if days_actual > 0:
+                        cur.execute(
+                            """UPDATE subscriptions
+                               SET expires_at = DATE_ADD(expires_at, INTERVAL %s DAY)
+                               WHERE id = %s""",
+                            (days_actual, sub_id),
+                        )
+                    log_msg = f"клиентская, добавлено {days_actual} из {freeze_days}"
+
+                # Сбрасываем счётчик использованных заморозок
+                cur.execute(
+                    """UPDATE subscriptions
+                       SET freeze_used = GREATEST(0, freeze_used - 1)
+                       WHERE id = %s""",
+                    (sub_id,),
+                )
+
+                conn.commit()
+                logger.info(
+                    "Заморозка %s завершена (%s), freeze_used скорректирован",
+                    freeze_id,
+                    log_msg,
+                )
+                return True
+
 
 class EventCache(BaseModel):
     TABLE = "events_cache"
