@@ -364,6 +364,20 @@ class User(BaseModel):
                     row["type"] = "visit"
                     items.append(row)
 
+                # Действия администратора (audit_log) по абонементам клиента
+                cur.execute(
+                    """SELECT a.created_at AS date, a.action, a.new_value
+                       FROM audit_log a
+                       JOIN subscriptions s ON s.id = a.record_id
+                       WHERE s.user_id = %s
+                         AND a.table_name = 'subscriptions'
+                       ORDER BY a.created_at DESC""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "audit"
+                    items.append(row)
+
         # Сортировка по дате DESC (datetime и date приводим к одному типу)
         def _sort_key(x: dict):
             value = x.get("date")
@@ -616,6 +630,36 @@ class Subscription(BaseModel):
                 return ok
 
     @classmethod
+    def add_days(cls, sub_id: int, delta: int) -> bool:
+        """Сдвинуть expires_at на delta дней (плюс/минус)."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE subscriptions SET expires_at = DATE_ADD(expires_at, INTERVAL %s DAY) WHERE id = %s",
+                    (delta, sub_id),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info("Абонемент %s: expires_at %+d дней", sub_id, delta)
+                return ok
+
+    @classmethod
+    def reset_freeze_used(cls, sub_id: int) -> bool:
+        """Обнулить счётчик использованных заморозок."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE subscriptions SET freeze_used = 0 WHERE id = %s",
+                    (sub_id,),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info("Абонемент %s: freeze_used сброшен в 0", sub_id)
+                return ok
+
+    @classmethod
     def update_freeze_used(cls, sub_id: int, delta: int = 1) -> bool:
         """Изменить счётчик использованных заморозок на delta (обычно +1)."""
         with get_connection() as conn:
@@ -670,6 +714,25 @@ class Freeze(BaseModel):
                     (subscription_id,),
                 )
                 return cur.fetchone()
+
+    @classmethod
+    def cancel_open_for_subscription(cls, subscription_id: int) -> bool:
+        """Отменить все открытые заморозки (approved/pending) абонемента."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE freezes SET status = 'cancelled'
+                       WHERE subscription_id = %s
+                         AND status IN ('approved', 'pending')""",
+                    (subscription_id,),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info(
+                        "Отменены открытые заморозки абонемента %s", subscription_id
+                    )
+                return ok
 
     @classmethod
     def get_approved_started(cls, subscription_id: int) -> dict | None:

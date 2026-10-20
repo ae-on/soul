@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import math
 import os
@@ -33,6 +34,7 @@ warnings.filterwarnings(
 from db.connection import get_connection
 from db.constants import CONSENT_TEXT, CONSENT_TEXT_VERSION
 from db.models import (
+    AuditLog,
     Booking,
     Freeze,
     Group,
@@ -152,6 +154,12 @@ PROFILE_FULL_NAME, PROFILE_PHONE = range(2)
 
 # Состояние диалога смены даты окончания абонемента (админка)
 ADMIN_SUB_EXPIRES_DATE = 10
+
+# Состояния диалога создания заморозки админом (даты начала/окончания)
+ADMIN_FREEZE_START, ADMIN_FREEZE_END = 11, 12
+
+# Состояния диалога редактирования профиля (супер-админ)
+ADMIN_PROFILE_FIELD, ADMIN_PROFILE_VALUE = 13, 14
 
 # Инициализируем FTS5 (база знаний) при старте
 sync_knowledge()
@@ -1086,19 +1094,38 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
 
     keyboard = [
         [InlineKeyboardButton("\U0001f4c5 История посещений", callback_data="sub_history")],
-        [InlineKeyboardButton("\U0001f9ca Заморозить", callback_data="sub_freeze")],
+    ]
+
+    # Кнопки заморозки — только если ещё не использована
+    if (sub.get("freeze_used") or 0) == 0:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f9ca Заморозить сейчас", callback_data="freeze_quick"
+                ),
+                InlineKeyboardButton(
+                    "\U0001f4c5 Заморозить на даты", callback_data="freeze_custom"
+                ),
+            ]
+        )
+
+    keyboard.append(
         [
             InlineKeyboardButton(
                 "\U0001f3e2 Купить на занятии", callback_data="sub_buy_offline"
             )
-        ],
+        ]
+    )
+    keyboard.append(
         [
             InlineKeyboardButton(
                 "\U0001f6d2 Продлить онлайн (ЕРИП)", callback_data="sub_buy_online"
             )
-        ],
-        [InlineKeyboardButton("\U0001f4d6 Правила пользования", url=RULES_URL)],
-    ]
+        ]
+    )
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f4d6 Правила пользования", url=RULES_URL)]
+    )
 
     # Активная заморозка — дополнительный блок и кнопка отмены
     if active_freeze:
@@ -1120,7 +1147,7 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard.append(
         [InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")]
     )
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
 
 async def show_subscription_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1158,6 +1185,20 @@ async def show_subscription_history(update: Update, context: ContextTypes.DEFAUL
                 lines.append(
                     f"\U0001f9ca {date_str} · Заморозка: {reason} ({days_str})"
                 )
+            elif item_type == "audit":
+                # Действия администратора (audit_log): например, изменение срока
+                line = f"\U0001f6e0\ufe0f {date_str} · Действие администратора"
+                try:
+                    payload = json.loads(item.get("new_value") or "{}")
+                except (ValueError, TypeError):
+                    payload = {}
+                delta = payload.get("delta")
+                if isinstance(delta, (int, float)):
+                    line = (
+                        f"\U0001f6e0\ufe0f {date_str} · Админ изменил срок "
+                        f"({delta:+g} {_plural_days(int(delta))})"
+                    )
+                lines.append(line)
             else:
                 # — visit —
                 visit_status = (item.get("status") or "").lower()
@@ -1199,12 +1240,17 @@ async def show_subscription_history(update: Update, context: ContextTypes.DEFAUL
 # ----------------------------------------------------------------------
 # Заглушки: заморозка, продление, покупка (полная логика — позже)
 # ----------------------------------------------------------------------
-FREEZE_REASONS = {
-    "vacation": "\U0001f3d6\ufe0f Отпуск",
-    "business": "\U0001f4bc Командировка",
-    "sick": "\U0001f3e5 Болезнь",
-    "other": "\u270f\ufe0f Другое",
-}
+def _plural_days(n: int) -> str:
+    """Склонение слова «день»: 1 день, 3 дня, 5 дней."""
+    n = abs(n)
+    if 11 <= n % 100 <= 14:
+        return "дней"
+    if n % 10 == 1:
+        return "день"
+    if n % 10 in (2, 3, 4):
+        return "дня"
+    return "дней"
+
 
 FREEZE_MAX_DAYS = 14
 
@@ -1233,199 +1279,6 @@ def _calc_freeze_period(expires_at) -> tuple[date, date, int]:
     return start, end, days
 
 
-async def show_sub_freeze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Клиентский сценарий заморозки — проверки и выбор причины."""
-    query = update.callback_query
-    await safe_answer(query)
-
-    user, sub = _get_user_and_active_sub(update)
-    if not user or not sub:
-        text = "\u26a0\ufe0f У вас нет активного абонемента."
-        keyboard = [
-            [InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")]
-        ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    sub_type = (
-        SubscriptionType.get_by_id(sub["type_id"]) if sub.get("type_id") else None
-    )
-    max_freezes = sub_type["freeze_count_max"] if sub_type else 0
-    if (sub.get("freeze_used") or 0) >= max_freezes:
-        text = "Вы уже использовали заморозку в этом абонементе."
-        keyboard = [
-            [InlineKeyboardButton("\U0001f519 Назад", callback_data="my_subscription")]
-        ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if Freeze.get_open_for_subscription(sub["id"]):
-        text = "\u26a0\ufe0f У вас уже есть активная заморозка или заявка на рассмотрении."
-        keyboard = [
-            [InlineKeyboardButton("\U0001f519 Назад", callback_data="my_subscription")]
-        ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    type_name = sub_type["name"] if sub_type else "Абонемент"
-    expires_at = sub.get("expires_at")
-    days_left = (expires_at.date() - date.today()).days if expires_at else None
-    days_left_str = f"{days_left} дней" if days_left is not None else "без лимита"
-
-    text = (
-        "\U0001f9ca Заморозка абонемента\n\n"
-        f"Абонемент: {type_name}\n"
-        f"Действует до: {_format_date(expires_at)} ({days_left_str})\n"
-        f"Доступно: до {FREEZE_MAX_DAYS} дней (или меньше, "
-        "если абонемент заканчивается раньше).\n\n"
-        "Выберите причину:"
-    )
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                FREEZE_REASONS["vacation"], callback_data="freeze_reason_vacation"
-            ),
-            InlineKeyboardButton(
-                FREEZE_REASONS["business"], callback_data="freeze_reason_business"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                FREEZE_REASONS["sick"], callback_data="freeze_reason_sick"
-            ),
-            InlineKeyboardButton(
-                FREEZE_REASONS["other"], callback_data="freeze_reason_other"
-            ),
-        ],
-        [InlineKeyboardButton("\U0001f519 Назад", callback_data="my_subscription")],
-    ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def show_sub_freeze_confirm(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, reason_key: str
-):
-    """Расчёт периода заморозки и экран подтверждения."""
-    query = update.callback_query
-    await safe_answer(query)
-
-    user, sub = _get_user_and_active_sub(update)
-    if not user or not sub:
-        await query.edit_message_text("\u26a0\ufe0f Активный абонемент не найден.")
-        return
-
-    start, end, days = _calc_freeze_period(sub.get("expires_at"))
-    reason_label = FREEZE_REASONS.get(reason_key, reason_key)
-
-    # Запоминаем причину — на экране подтверждения кнопка freeze_confirm без данных
-    context.user_data["pending_freeze_reason"] = reason_key
-
-    text = (
-        "\U0001f9ca Заморозка абонемента\n\n"
-        f"\U0001f4c5 Заморозка: с {_format_date(start)} "
-        f"по {_format_date(end)} ({days} дней)\n"
-        f"Причина: {reason_label}\n\n"
-        "После подтверждения админом абонемент будет продлён "
-        f"на {days} дней."
-    )
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "\u2705 Подтвердить", callback_data="freeze_confirm"
-            )
-        ],
-        [InlineKeyboardButton("\U0001f519 Отмена", callback_data="sub_freeze")],
-    ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def submit_freeze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Создание заявки на заморозку и уведомление админу."""
-    query = update.callback_query
-    await safe_answer(query)
-
-    # Причина была сохранена на предыдущем шаге (экран подтверждения)
-    reason_key = context.user_data.pop("pending_freeze_reason", None)
-    if not reason_key or reason_key not in FREEZE_REASONS:
-        await query.edit_message_text(
-            "\u26a0\ufe0f Действие устарело. Нажмите «\U0001f9ca Заморозить» заново."
-        )
-        return
-
-    user, sub = _get_user_and_active_sub(update)
-    if not user or not sub:
-        await query.edit_message_text("\u26a0\ufe0f Активный абонемент не найден.")
-        return
-    if Freeze.get_open_for_subscription(sub["id"]):
-        await query.edit_message_text(
-            "\u26a0\ufe0f У вас уже есть активная заморозка или заявка на рассмотрении."
-        )
-        return
-
-    start, end, days = _calc_freeze_period(sub.get("expires_at"))
-
-    # Строгая защита: период заморозки не может выходить за срок абонемента
-    if sub.get("expires_at"):
-        max_end = (
-            sub["expires_at"].date()
-            if isinstance(sub["expires_at"], datetime)
-            else sub["expires_at"]
-        )
-        if end > max_end:
-            end = max_end
-            days = (end - start).days + 1
-
-    reason_label = FREEZE_REASONS.get(reason_key, reason_key)
-
-    # days — generated column в MySQL, её НЕ передаём
-    freeze_id = Freeze.create(
-        subscription_id=sub["id"],
-        start_date=start,
-        end_date=end,
-        reason=reason_label,
-        created_by=user["id"],
-        status="pending",
-    )
-    logger.info(
-        "Заявка на заморозку %s: пользователь %s, период %s — %s (%s дней)",
-        freeze_id,
-        user["id"],
-        start,
-        end,
-        days,
-    )
-
-    # Уведомление админу с кнопками подтверждения/отклонения.
-    # ФИО и telegram_id берём из БД (поле full_name таблицы users)
-    full_name = user.get("full_name") or ""
-    admin_msg = (
-        "\U0001f9ca Заявка на заморозку\n\n"
-        f"Клиент: {full_name or '—'} (ID {user.get('telegram_id')})\n"
-        f"Абонемент: #{sub['id']}\n"
-        f"Период: {_format_date(start)} — {_format_date(end)} ({days} дней)\n"
-        f"Причина: {reason_label}"
-    )
-    admin_keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "\u2705 Подтвердить", callback_data=f"freeze_approve_{freeze_id}"
-                ),
-                InlineKeyboardButton(
-                    "\u274c Отклонить", callback_data=f"freeze_reject_{freeze_id}"
-                ),
-            ]
-        ]
-    )
-    await notify_admin(context, admin_msg, reply_markup=admin_keyboard)
-
-    text = "\u2705 Заявка на заморозку отправлена. Ждите подтверждения администратора."
-    keyboard = [
-        [InlineKeyboardButton("\U0001f519 В меню", callback_data="my_subscription")]
-    ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
 async def handle_freeze_approve(
     update: Update, context: ContextTypes.DEFAULT_TYPE, freeze_id: int
 ):
@@ -1450,18 +1303,9 @@ async def handle_freeze_approve(
 
     Freeze.approve(freeze_id, admin["id"])
     Subscription.update_freeze_used(freeze["subscription_id"], 1)
-    # Сдвигаем срок абонемента на дни заморозки ровно один раз (после approve)
-    freeze_days = freeze.get("days") or 0
-    if freeze_days > 0:
-        Subscription.extend_expires(freeze["subscription_id"], freeze_days)
-    logger.info(
-        "Админ %s одобрил заморозку %s (абонемент продлён на %s дней)",
-        admin["id"],
-        freeze_id,
-        freeze_days,
-    )
+    logger.info("Админ %s одобрил заморозку %s", admin["id"], freeze_id)
 
-    # Уведомляем клиента
+    # Уведомляем клиента (срок продлится при завершении заморозки)
     sub = Subscription.get_by_id(freeze["subscription_id"])
     client = User.get_by_id(sub["user_id"]) if sub else None
     if client and client.get("telegram_id"):
@@ -1472,7 +1316,7 @@ async def handle_freeze_approve(
                     "\u2705 Ваша заморозка подтверждена "
                     f"с {_format_date(freeze['start_date'])} "
                     f"по {_format_date(freeze['end_date'])}.\n"
-                    f"Абонемент продлён на {freeze_days} дней."
+                    "Срок абонемента продлится, когда заморозка завершится."
                 ),
             )
         except Exception as e:
@@ -1574,25 +1418,29 @@ def check_and_complete_freeze(user_id: int) -> bool:
     start = freeze["start_date"]
     if isinstance(start, datetime):
         start = start.date()
-    end = freeze["end_date"]
-    if isinstance(end, datetime):
-        end = end.date()
 
-    # Фактическое окончание — сегодня, но не позже запланированного
-    actual_end = min(today, end)
-    days_actual = max(1, (actual_end - start).days + 1)
+    # Фактические дни заморозки: от начала до сегодня (не больше запланированных)
+    freeze_days = freeze.get("days") or 0
+    days_actual = max(0, min((today - start).days, freeze_days))
 
-    Freeze.complete(freeze["id"], actual_end, days_actual)
-    # Дни были добавлены к expires_at при одобрении — вычитаем неиспользованные
-    remaining = (freeze.get("days") or 0) - days_actual
-    if remaining > 0:
-        Subscription.extend_expires(sub["id"], -remaining)
-    logger.info(
-        "Заморозка завершена досрочно, абонемент %s: использовано %s из %s дней",
-        sub["id"],
-        days_actual,
-        freeze.get("days") or 0,
-    )
+    Freeze.complete(freeze["id"], today, days_actual)
+    # Админская заморозка уже продлила срок при создании — не добавляем повторно.
+    # Клиентскую продлеваем на фактическое число дней.
+    if (freeze.get("reason") or "") == "По решению админа":
+        logger.info(
+            "Заморозка %s завершена (админская), абонемент %s: срок уже был продлён",
+            freeze["id"],
+            sub["id"],
+        )
+    else:
+        if days_actual > 0:
+            Subscription.add_days(sub["id"], days_actual)
+        logger.info(
+            "Заморозка завершена, абонемент %s: добавлено %s из %s дней",
+            sub["id"],
+            days_actual,
+            freeze_days,
+        )
     return True
 
 
@@ -2606,11 +2454,187 @@ async def show_admin_user_card(
                 "\U0001f4b0 Абонементы", callback_data=f"admin_user_subs_{user_id}"
             ),
         ],
-        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_clients_page_1_all")],
     ]
-    await update.callback_query.edit_message_text(
-        text, reply_markup=InlineKeyboardMarkup(keyboard)
+
+    # Редактирование профиля доступно только супер-админам
+    viewer_roles = UserRole.get_active_roles(admin["id"])
+    if "super_admin" in viewer_roles:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\u2699\ufe0f Редактировать профиль",
+                    callback_data=f"admin_profile_edit_{user_id}",
+                )
+            ]
+        )
+
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_clients_page_1_all")]
     )
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup)
+
+
+# ----------------------------------------------------------------------
+# Редактирование профиля пользователя (только super_admin)
+# ----------------------------------------------------------------------
+ADMIN_PROFILE_FIELDS = {
+    "name": "ФИО",
+    "phone": "Телефон",
+    "email": "Email",
+    "notes": "Заметки",
+}
+
+
+async def admin_profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню редактирования профиля (доступно только super_admin)."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return ConversationHandler.END
+    query = update.callback_query
+
+    if "super_admin" not in UserRole.get_active_roles(admin["id"]):
+        await safe_answer(query, "Нет доступа", show_alert=True)
+        return ConversationHandler.END
+
+    # ConversationHandler вызывает обработчик только с (update, context) —
+    # ID пользователя достаём из callback_data
+    try:
+        user_id = int(query.data.replace("admin_profile_edit_", ""))
+    except (ValueError, AttributeError):
+        await query.edit_message_text("Ошибка: неверный ID пользователя.")
+        return ConversationHandler.END
+
+    target = User.get_by_id(user_id)
+    if not target:
+        await safe_answer(query, "Пользователь не найден", show_alert=True)
+        return ConversationHandler.END
+
+    context.user_data["admin_profile_user_id"] = user_id
+
+    text = (
+        f"\u2699\ufe0f Редактирование профиля: "
+        f"{target.get('full_name') or target.get('username') or user_id}\n\n"
+        "Что изменить?"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\u270f\ufe0f ФИО", callback_data="admin_profile_field_name"
+            ),
+            InlineKeyboardButton(
+                "\U0001f4f1 Телефон", callback_data="admin_profile_field_phone"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f4e7 Email", callback_data="admin_profile_field_email"
+            ),
+            InlineKeyboardButton(
+                "\U0001f5d2\ufe0f Заметки", callback_data="admin_profile_field_notes"
+            ),
+        ],
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_profile_cancel")],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return ADMIN_PROFILE_FIELD
+
+
+async def admin_profile_choose_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор поля — запрос нового значения."""
+    query = update.callback_query
+    await safe_answer(query)
+
+    field_key = query.data.replace("admin_profile_field_", "")
+    if field_key not in ADMIN_PROFILE_FIELDS:
+        return ADMIN_PROFILE_FIELD
+
+    context.user_data["admin_profile_field"] = field_key
+    label = ADMIN_PROFILE_FIELDS[field_key]
+    text = (
+        f"Введите новое значение для «{label}»:\n\n"
+        "(или нажмите /cancel чтобы отменить)"
+    )
+    keyboard = [[InlineKeyboardButton("\U0001f519 Отмена", callback_data="admin_profile_cancel")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return ADMIN_PROFILE_VALUE
+
+
+async def admin_profile_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Валидация и сохранение нового значения поля."""
+    value = update.message.text.strip()
+    field_key = context.user_data.get("admin_profile_field")
+    user_id = context.user_data.get("admin_profile_user_id")
+    if not field_key or not user_id:
+        await update.message.reply_text("Диалог устарел. Откройте редактирование заново.")
+        return ConversationHandler.END
+
+    # Валидация
+    if field_key == "name" and len(value) < 3:
+        await update.message.reply_text(
+            "\u26a0\ufe0f ФИО должно содержать минимум 3 символа. Введите ещё раз:"
+        )
+        return ADMIN_PROFILE_VALUE
+    if field_key == "phone":
+        digits = re.sub(r"\D", "", value)
+        if len(digits) < 7:
+            await update.message.reply_text(
+                "\u26a0\ufe0f В телефоне должно быть минимум 7 цифр. Введите ещё раз:"
+            )
+            return ADMIN_PROFILE_VALUE
+    if field_key == "email" and not re.match(r"^[^@\s]+@[^@\s]+$", value):
+        await update.message.reply_text(
+            "\u26a0\ufe0f Неверный email. Введите ещё раз:"
+        )
+        return ADMIN_PROFILE_VALUE
+
+    # Сохраняем
+    if field_key == "name":
+        User.update(user_id, full_name=value)
+    elif field_key == "phone":
+        User.update(user_id, phone=value)
+    elif field_key == "email":
+        User.update(user_id, email=value)
+    elif field_key == "notes":
+        User.update(user_id, notes=value)
+
+    label = ADMIN_PROFILE_FIELDS[field_key]
+    logger.info(
+        "Супер-админ (telegram %s) изменил поле %s пользователя %s",
+        update.effective_user.id,
+        label,
+        user_id,
+    )
+
+    await update.message.reply_text(f"\u2705 {label} обновлено.")
+    context.user_data.pop("admin_profile_field", None)
+    context.user_data.pop("admin_profile_user_id", None)
+    # Возвращаемся к карточке пользователя
+    await show_admin_user_card(update, context, user_id)
+    return ConversationHandler.END
+
+
+async def admin_profile_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена редактирования профиля (кнопка или /cancel)."""
+    user_id = context.user_data.get("admin_profile_user_id")
+    context.user_data.pop("admin_profile_field", None)
+    context.user_data.pop("admin_profile_user_id", None)
+
+    if update.callback_query:
+        await safe_answer(update.callback_query)
+        await update.callback_query.edit_message_text(
+            "\u2699\ufe0f Редактирование отменено."
+        )
+    else:
+        await update.message.reply_text("\u2699\ufe0f Редактирование отменено.")
+
+    if user_id:
+        await show_admin_user_card(update, context, user_id)
+    return ConversationHandler.END
 
 
 async def show_admin_roles(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2970,10 +2994,23 @@ async def show_admin_sub_manage(
         hours_total = sub.get("hours_total")
         hours_line = f"Осталось: {hours_left}ч из {hours_total}ч"
 
+    # Активная заморозка — для строки статуса и кнопок
+    active_freeze = Freeze.get_active_for_subscription(sub_id)
+    if active_freeze:
+        freeze_line = (
+            f"\U0001f9ca Активная заморозка: "
+            f"с {_format_date(active_freeze['start_date'])} "
+            f"по {_format_date(active_freeze['end_date'])} "
+            f"({active_freeze.get('days') or 0} дней)"
+        )
+    else:
+        freeze_line = "\U0001f9ca Заморозка не активна."
+
     text = (
         f"\u2699\ufe0f Управление: {type_name}\n"
         f"{hours_line}\n"
-        f"Действует до: {_format_date(sub.get('expires_at'))}"
+        f"Действует до: {_format_date(sub.get('expires_at'))}\n"
+        f"{freeze_line}"
     )
     if notice:
         text = f"{notice}\n\n{text}"
@@ -2995,6 +3032,23 @@ async def show_admin_sub_manage(
                 "\u2796 1.5ч", callback_data=f"admin_sub_sub_hours_{sub_id}_1.5"
             ),
         ],
+        # Изменение срока: +/- дни
+        [
+            InlineKeyboardButton(
+                "\u2795 1 день", callback_data=f"admin_sub_add_days_{sub_id}_1"
+            ),
+            InlineKeyboardButton(
+                "\u2796 1 день", callback_data=f"admin_sub_add_days_{sub_id}_-1"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\u2795 7 дней", callback_data=f"admin_sub_add_days_{sub_id}_7"
+            ),
+            InlineKeyboardButton(
+                "\u2796 7 дней", callback_data=f"admin_sub_add_days_{sub_id}_-7"
+            ),
+        ],
         [
             InlineKeyboardButton(
                 "\U0001f4c5 Изменить дату окончания",
@@ -3009,8 +3063,8 @@ async def show_admin_sub_manage(
         ],
     ]
 
-    # Управление заморозкой абонемента
-    if Freeze.get_active_for_subscription(sub_id):
+    # Управление заморозкой: две кнопки (быстрая / на даты)
+    if active_freeze:
         keyboard.append(
             [
                 InlineKeyboardButton(
@@ -3023,11 +3077,24 @@ async def show_admin_sub_manage(
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    "\U0001f9ca Заморозить (14 дней)",
-                    callback_data=f"admin_sub_freeze_{sub_id}",
-                )
+                    "\U0001f9ca Заморозить сейчас",
+                    callback_data=f"freeze_quick_{sub_id}",
+                ),
+                InlineKeyboardButton(
+                    "\U0001f4c5 Заморозить на даты",
+                    callback_data=f"freeze_custom_{sub_id}",
+                ),
             ]
         )
+    # Сброс заморозок доступен всегда
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "\U0001f504 Сбросить заморозки",
+                callback_data=f"admin_sub_reset_freezes_{sub_id}",
+            )
+        ]
+    )
 
     keyboard.append(
         [
@@ -3048,7 +3115,7 @@ async def show_admin_sub_manage(
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if query:
-        await query.edit_message_text(text, reply_markup=reply_markup)
+        await _safe_edit(query, text, reply_markup)
     else:
         await update.message.reply_text(text, reply_markup=reply_markup)
 
@@ -3077,10 +3144,382 @@ async def handle_sub_sub_hours(
     await show_admin_sub_manage(update, context, sub_id)
 
 
-async def handle_admin_sub_freeze(
+async def handle_admin_sub_add_days(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int, delta: int
+):
+    """Админ сдвигает срок абонемента на delta дней (+/-) с записью в audit_log."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    if not Subscription.add_days(sub_id, delta):
+        await safe_answer(query, "Не удалось изменить срок", show_alert=True)
+        return
+
+    # Пишем в audit_log
+    try:
+        AuditLog.create(
+            user_id=admin["id"],
+            action="add_days",
+            table_name="subscriptions",
+            record_id=sub_id,
+            new_value=json.dumps({"delta": delta}),
+        )
+    except Exception as e:
+        logger.error("Не удалось записать audit_log: %s", e)
+
+    logger.info(
+        "Админ %s изменил срок абонемента %s на %+d %s",
+        admin["id"],
+        sub_id,
+        delta,
+        _plural_days(delta),
+    )
+    await show_admin_sub_manage(
+        update,
+        context,
+        sub_id,
+        notice=f"\U0001f4c5 Срок изменён на {delta:+d} {_plural_days(delta)}",
+    )
+
+
+async def handle_freeze_quick(update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int = None):
+    """
+    Быстрая заморозка (14 дней или до конца срока).
+    Для админа — sub_id из callback; для клиента — sub_id=None (активный абонемент).
+    """
+    query = update.callback_query
+    await safe_answer(query)
+
+    is_admin = False
+    admin = None
+    user = None
+    if sub_id is not None:
+        # Админ: проверяем роль
+        admin = await _require_admin(update, context)
+        if not admin:
+            return
+        is_admin = True
+        sub = Subscription.get_by_id(sub_id)
+        if not sub:
+            await safe_answer(query, "Абонемент не найден", show_alert=True)
+            return
+    else:
+        # Клиент: берём активный абонемент
+        user, sub = _get_user_and_active_sub(update)
+        if not user or not sub:
+            await query.edit_message_text("\u26a0\ufe0f Нет активного абонемента.")
+            return
+        if (sub.get("freeze_used") or 0) > 0:
+            await query.edit_message_text("Вы уже использовали заморозку.")
+            return
+        sub_id = sub["id"]
+
+    if Freeze.get_active_for_subscription(sub_id):
+        await safe_answer(query, "Уже есть активная заморозка", show_alert=True)
+        return
+
+    expires = sub.get("expires_at")
+    if not expires or expires.date() <= date.today():
+        await safe_answer(query, "Абонемент истёк", show_alert=True)
+        return
+
+    days_allowed = (expires.date() - date.today()).days
+    freeze_days = min(FREEZE_MAX_DAYS, days_allowed)
+    start = date.today()
+    end = start + timedelta(days=freeze_days)
+
+    # days — generated column, НЕ передаём
+    freeze_id = Freeze.create(
+        subscription_id=sub_id,
+        start_date=start,
+        end_date=end,
+        reason="Быстрая заморозка",
+        created_by=admin["id"] if is_admin else user["id"],
+        status="approved" if is_admin else "pending",
+    )
+
+    if is_admin:
+        # Админ: сразу сдвигаем срок
+        Subscription.extend_expires(sub_id, freeze_days)
+        client = User.get_by_id(sub["user_id"]) if sub.get("user_id") else None
+        if client and client.get("telegram_id"):
+            try:
+                await context.bot.send_message(
+                    chat_id=client["telegram_id"],
+                    text=f"\U0001f9ca Администратор заморозил ваш абонемент на {freeze_days} дней.",
+                )
+            except Exception as e:
+                logger.error("Не удалось уведомить клиента %s: %s", client["telegram_id"], e)
+        logger.info("Админ быстрая заморозка %s: %s дней", sub_id, freeze_days)
+        await show_admin_sub_manage(
+            update, context, sub_id, notice=f"\U0001f9ca Быстрая заморозка на {freeze_days} дней"
+        )
+    else:
+        # Клиент: заявка на одобрение
+        full_name = user.get("full_name") or ""
+        admin_msg = (
+            "\U0001f9ca Заявка на быструю заморозку\n\n"
+            f"Клиент: {full_name or '—'} (ID {user.get('telegram_id')})\n"
+            f"Абонемент: #{sub_id}\n"
+            f"Период: {_format_date(start)} — {_format_date(end)} ({freeze_days} дней)"
+        )
+        admin_keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "\u2705 Подтвердить", callback_data=f"freeze_approve_{freeze_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "\u274c Отклонить", callback_data=f"freeze_reject_{freeze_id}"
+                    ),
+                ]
+            ]
+        )
+        await notify_admin(context, admin_msg, reply_markup=admin_keyboard)
+        logger.info("Клиент %s запросил быструю заморозку %s", user["id"], freeze_id)
+        await query.edit_message_text(
+            "\u2705 Заявка на быструю заморозку отправлена. Ждите подтверждения."
+        )
+
+
+async def freeze_custom_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Единый вход для кастомной заморозки (админ и клиент).
+    Админ: callback freeze_custom_{sub_id}. Клиент: callback freeze_custom.
+    """
+    query = update.callback_query
+    await safe_answer(query)
+
+    # Определяем, кто вызывает
+    user = User.get_by_telegram_id(update.effective_user.id)
+    if not user:
+        await query.edit_message_text("Ошибка: пользователь не найден.")
+        return ConversationHandler.END
+    roles = UserRole.get_active_roles(user["id"])
+    is_admin = "admin" in roles or "super_admin" in roles
+
+    if is_admin:
+        # Админ: sub_id из callback
+        try:
+            sub_id = int(query.data.replace("freeze_custom_", ""))
+        except (ValueError, AttributeError):
+            await query.edit_message_text("Ошибка: неверный ID абонемента.")
+            return ConversationHandler.END
+        context.user_data["freeze_is_admin"] = True
+        context.user_data["freeze_admin_id"] = user["id"]
+    else:
+        # Клиент: активный абонемент
+        _, sub = _get_user_and_active_sub(update)
+        if not sub:
+            await query.edit_message_text("\u26a0\ufe0f Нет активного абонемента.")
+            return ConversationHandler.END
+        if (sub.get("freeze_used") or 0) > 0:
+            await query.edit_message_text("Вы уже использовали заморозку.")
+            return ConversationHandler.END
+        if Freeze.get_open_for_subscription(sub["id"]):
+            await query.edit_message_text("Заморозка уже действует (или заявка на рассмотрении).")
+            return ConversationHandler.END
+        sub_id = sub["id"]
+        context.user_data["freeze_is_admin"] = False
+        context.user_data["freeze_client_user_id"] = user["id"]
+
+    context.user_data["freeze_sub_id"] = sub_id
+    sub = Subscription.get_by_id(sub_id)
+    if not sub:
+        await query.edit_message_text("Абонемент не найден.")
+        return ConversationHandler.END
+
+    text = (
+        "\U0001f4c5 Заморозка на даты\n\n"
+        f"Действует до: {_format_date(sub.get('expires_at'))}\n\n"
+        "Введите дату НАЧАЛА в формате ДД.ММ.ГГГГ "
+        "(или «-» чтобы поставить на сегодня):"
+    )
+    await query.edit_message_text(text)
+    return ADMIN_FREEZE_START
+
+
+async def freeze_custom_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2 — валидация даты начала, запрос даты окончания."""
+    raw = update.message.text.strip()
+    if raw == "-":
+        start = date.today()
+    else:
+        start = _parse_freeze_date(raw)
+        if start is None:
+            await update.message.reply_text(
+                "\u26a0\ufe0f Неверный формат. Введите ДД.ММ.ГГГГ (или «-»):"
+            )
+            return ADMIN_FREEZE_START
+        if start < date.today():
+            await update.message.reply_text(
+                "\u26a0\ufe0f Дата начала должна быть сегодня или в будущем:"
+            )
+            return ADMIN_FREEZE_START
+
+    sub_id = context.user_data.get("freeze_sub_id")
+    sub = Subscription.get_by_id(sub_id) if sub_id else None
+    if sub and sub.get("expires_at"):
+        exp_date = sub["expires_at"].date() if isinstance(sub["expires_at"], datetime) else sub["expires_at"]
+        if start > exp_date:
+            await update.message.reply_text(
+                f"\u26a0\ufe0f Дата начала ({_format_date(start)}) позже окончания абонемента "
+                f"({_format_date(exp_date)}). Введите ещё раз:"
+            )
+            return ADMIN_FREEZE_START
+
+    context.user_data["freeze_start"] = start
+    await update.message.reply_text(
+        f"\U0001f4c5 Начало: {_format_date(start)}\n\n"
+        "Введите дату ОКОНЧАНИЯ (ДД.ММ.ГГГГ) или «-» для максимального срока:"
+    )
+    return ADMIN_FREEZE_END
+
+
+async def freeze_custom_end_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 3 — валидация, создание заморозки, сдвиг срока, уведомление."""
+    raw = update.message.text.strip()
+    end = _parse_freeze_date(raw) if raw != "-" else None
+
+    sub_id = context.user_data.get("freeze_sub_id")
+    start = context.user_data.get("freeze_start")
+    is_admin = context.user_data.get("freeze_is_admin", False)
+    admin_id = context.user_data.get("freeze_admin_id")
+    client_user_id = context.user_data.get("freeze_client_user_id")
+
+    if not sub_id or not start:
+        await update.message.reply_text("Диалог устарел. Начните заново.")
+        return ConversationHandler.END
+
+    sub = Subscription.get_by_id(sub_id)
+    if not sub:
+        await update.message.reply_text("Абонемент не найден.")
+        return ConversationHandler.END
+
+    # Максимальная дата окончания: start + 14 дней, но не позже expires_at
+    max_end = start + timedelta(days=FREEZE_MAX_DAYS)
+    if sub.get("expires_at"):
+        exp_date = sub["expires_at"].date() if isinstance(sub["expires_at"], datetime) else sub["expires_at"]
+        max_end = min(max_end, exp_date)
+
+    if end is None:
+        # «-» = максимальный срок
+        end = max_end
+    else:
+        if end <= start:
+            await update.message.reply_text(
+                "\u26a0\ufe0f Дата окончания должна быть позже даты начала. Введите ещё раз:"
+            )
+            return ADMIN_FREEZE_END
+        if end > max_end:
+            await update.message.reply_text(
+                f"\u26a0\ufe0f Максимальная дата: {_format_date(max_end)}. Введите ещё раз:"
+            )
+            return ADMIN_FREEZE_END
+
+    days = (end - start).days
+
+    # days — generated column, НЕ передаём
+    freeze_id = Freeze.create(
+        subscription_id=sub_id,
+        start_date=start,
+        end_date=end,
+        reason="Кастомная заморозка",
+        created_by=admin_id or client_user_id or update.effective_user.id,
+        status="approved" if is_admin else "pending",
+    )
+
+    context.user_data.pop("freeze_sub_id", None)
+    context.user_data.pop("freeze_start", None)
+    context.user_data.pop("freeze_is_admin", None)
+    context.user_data.pop("freeze_admin_id", None)
+    context.user_data.pop("freeze_client_user_id", None)
+
+    if is_admin:
+        Subscription.extend_expires(sub_id, days)
+        client = User.get_by_id(sub["user_id"]) if sub.get("user_id") else None
+        if client and client.get("telegram_id"):
+            try:
+                await context.bot.send_message(
+                    chat_id=client["telegram_id"],
+                    text=(
+                        "\U0001f9ca Администратор заморозил ваш абонемент "
+                        f"с {_format_date(start)} по {_format_date(end)} "
+                        f"(+{days} дней к сроку)."
+                    ),
+                )
+            except Exception as e:
+                logger.error("Не удалось уведомить клиента %s: %s", client["telegram_id"], e)
+        logger.info("Админ кастомная заморозка %s: %s — %s (%s дней)", sub_id, start, end, days)
+        await update.message.reply_text(
+            f"\u2705 Заморозка создана: {_format_date(start)} — {_format_date(end)} ({days} дней)."
+        )
+        await show_admin_sub_manage(update, context, sub_id)
+    else:
+        # Клиент: заявка на одобрение
+        user = User.get_by_id(client_user_id) if client_user_id else None
+        full_name = user.get("full_name") if user else ""
+        admin_msg = (
+            "\U0001f9ca Заявка на кастомную заморозку\n\n"
+            f"Клиент: {full_name or '—'} (ID {user.get('telegram_id') if user else '—'})\n"
+            f"Абонемент: #{sub_id}\n"
+            f"Период: {_format_date(start)} — {_format_date(end)} ({days} дней)"
+        )
+        admin_keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "\u2705 Подтвердить", callback_data=f"freeze_approve_{freeze_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "\u274c Отклонить", callback_data=f"freeze_reject_{freeze_id}"
+                    ),
+                ]
+            ]
+        )
+        await notify_admin(context, admin_msg, reply_markup=admin_keyboard)
+        logger.info("Клиент %s запросил кастомную заморозку %s", client_user_id, freeze_id)
+        await update.message.reply_text(
+            "\u2705 Заявка на заморозку отправлена. Ждите подтверждения."
+        )
+
+    return ConversationHandler.END
+
+
+async def freeze_custom_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена диалога кастомной заморозки."""
+    sub_id = context.user_data.get("freeze_sub_id")
+    context.user_data.pop("freeze_sub_id", None)
+    context.user_data.pop("freeze_start", None)
+    context.user_data.pop("freeze_is_admin", None)
+    context.user_data.pop("freeze_admin_id", None)
+    context.user_data.pop("freeze_client_user_id", None)
+
+    if update.callback_query:
+        await safe_answer(update.callback_query)
+        await update.callback_query.edit_message_text("\u274c Создание заморозки отменено.")
+    else:
+        await update.message.reply_text("\u274c Создание заморозки отменено.")
+
+    if sub_id:
+        await show_admin_sub_manage(update, context, sub_id)
+    return ConversationHandler.END
+
+
+def _parse_freeze_date(raw: str) -> Optional[date]:
+    """Парсит дату ДД.ММ.ГГГГ; None при неверном формате."""
+    try:
+        return datetime.strptime(raw, "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+
+async def handle_admin_sub_reset_freezes(
     update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
 ):
-    """Админ замораживает абонемент на 14 дней (или до конца срока)."""
+    """Сброс заморозок абонемента: отмена открытых и обнуление счётчика."""
     admin = await _require_admin(update, context)
     if not admin:
         return
@@ -3091,60 +3530,24 @@ async def handle_admin_sub_freeze(
         await safe_answer(query, "Абонемент не найден", show_alert=True)
         return
 
-    # Активная заморозка уже есть — не дублируем
-    if Freeze.get_active_for_subscription(sub_id):
+    # Нечего сбрасывать: открытых заморозок нет и счётчик уже обнулён
+    open_freeze = Freeze.get_open_for_subscription(sub_id)
+    if not open_freeze and (sub.get("freeze_used") or 0) == 0:
         await safe_answer(
-            query, "У абонемента уже есть активная заморозка", show_alert=True
+            query, "Сбрасывать нечего, заморозок нет.", show_alert=True
         )
+        await show_admin_sub_manage(update, context, sub_id)
         return
 
-    # Доступные дни: min(14, остаток срока абонемента)
-    today = date.today()
-    if sub.get("expires_at"):
-        exp_date = (
-            sub["expires_at"].date()
-            if isinstance(sub["expires_at"], datetime)
-            else sub["expires_at"]
-        )
-        days = min(FREEZE_MAX_DAYS, (exp_date - today).days)
-    else:
-        days = FREEZE_MAX_DAYS
-    if days <= 0:
-        await safe_answer(
-            query, "Абонемент заканчивается — заморозка невозможна", show_alert=True
-        )
-        return
-
-    start = today
-    end = today + timedelta(days=days)
-
-    # days — generated column в MySQL, её НЕ передаём
-    Freeze.create(
-        subscription_id=sub_id,
-        start_date=start,
-        end_date=end,
-        reason="По решению админа",
-        created_by=admin["id"],
-        status="approved",
-    )
-    Subscription.update_freeze_used(sub_id, 1)
-    logger.info("Админ %s заморозил абонемент %s на %s дней", admin["id"], sub_id, days)
-
-    # Уведомляем клиента
-    client = User.get_by_id(sub["user_id"]) if sub.get("user_id") else None
-    if client and client.get("telegram_id"):
-        try:
-            await context.bot.send_message(
-                chat_id=client["telegram_id"],
-                text=f"\U0001f9ca Администратор заморозил ваш абонемент на {days} дней.",
-            )
-        except Exception as e:
-            logger.error(
-                "Не удалось уведомить клиента %s: %s", client["telegram_id"], e
-            )
+    Freeze.cancel_open_for_subscription(sub_id)
+    Subscription.reset_freeze_used(sub_id)
+    logger.info("Админ %s сбросил заморозки абонемента %s", admin["id"], sub_id)
 
     await show_admin_sub_manage(
-        update, context, sub_id, notice=f"\U0001f9ca Абонемент заморожен на {days} дней"
+        update,
+        context,
+        sub_id,
+        notice="\u2705 Все заморозки отменены.",
     )
 
 
@@ -3162,31 +3565,42 @@ async def handle_admin_sub_unfreeze(
         await safe_answer(query, "Активная заморозка не найдена", show_alert=True)
         return
 
-    # Завершаем сегодняшним днём и возвращаем фактические дни к expires_at
+    # Завершаем сегодняшним днём
     today = date.today()
     start = freeze["start_date"]
     if isinstance(start, datetime):
         start = start.date()
-    end = freeze["end_date"]
-    if isinstance(end, datetime):
-        end = end.date()
 
-    actual_end = min(today, end)
-    days = max(1, (actual_end - start).days + 1)
+    freeze_days = freeze.get("days") or 0
+    elapsed = max(0, (today - start).days)
 
-    Freeze.complete(freeze["id"], actual_end, days)
-    # Дни были добавлены к expires_at при одобрении — вычитаем неиспользованные
-    remaining = (freeze.get("days") or 0) - days
-    if remaining > 0:
-        Subscription.extend_expires(sub_id, -remaining)
-    logger.info(
-        "Админ %s снял заморозку %s (абонемент %s): использовано %s из %s дней",
-        admin["id"],
-        freeze["id"],
-        sub_id,
-        days,
-        freeze.get("days") or 0,
-    )
+    Freeze.complete(freeze["id"], today, elapsed)
+
+    # Админская заморозка продлила срок при создании — возвращаем неиспользованные дни.
+    # Клиентская (без продления при создании) — добавляем фактически использованные.
+    if (freeze.get("reason") or "") == "По решению админа":
+        unused = freeze_days - elapsed
+        if unused > 0:
+            Subscription.extend_expires(sub_id, -unused)
+        logger.info(
+            "Админ %s снял заморозку %s (абонемент %s): использовано %s из %s дней, возвращено %s",
+            admin["id"],
+            freeze["id"],
+            sub_id,
+            elapsed,
+            freeze_days,
+            max(0, unused),
+        )
+    else:
+        if elapsed > 0:
+            Subscription.add_days(sub_id, elapsed)
+        logger.info(
+            "Админ %s снял клиентскую заморозку %s (абонемент %s): добавлено %s дней",
+            admin["id"],
+            freeze["id"],
+            sub_id,
+            elapsed,
+        )
 
     # Уведомляем клиента
     sub = Subscription.get_by_id(sub_id)
@@ -3726,20 +4140,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_subscription_history(update, context)
         return
 
-    if data == "sub_freeze":
-        await show_sub_freeze(update, context)
+    # Клиент: быстрая заморозка (без sub_id — берём активный абонемент)
+    if data == "freeze_quick":
+        await handle_freeze_quick(update, context)
         return
 
-    # Клиент: выбор причины заморозки
-    if data.startswith("freeze_reason_"):
-        reason_key = data[len("freeze_reason_"):]
-        if reason_key in FREEZE_REASONS:
-            await show_sub_freeze_confirm(update, context, reason_key)
-            return
-
-    # Клиент: подтверждение заявки на заморозку
-    if data == "freeze_confirm":
-        await submit_freeze(update, context)
+    # Клиент: кастомная заморозка (без sub_id — ConversationHandler)
+    if data == "freeze_custom":
+        await freeze_custom_start(update, context)
         return
 
     # Админ: одобрение/отклонение заявки (из чата администратора)
@@ -3896,17 +4304,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_sub_sub_hours(update, context, sid, hours)
             return
 
-    # Заморозка из админки
-    if data.startswith("admin_sub_freeze_"):
-        sid = _extract_int(data, "admin_sub_freeze_")
+    # Изменение срока: admin_sub_add_days_{sub_id}_{delta} (delta может быть отрицательным)
+    if data.startswith("admin_sub_add_days_"):
+        parsed = _extract_two_ints(data, "admin_sub_add_days_")
+        if parsed:
+            sid, delta = parsed
+            await handle_admin_sub_add_days(update, context, sid, delta)
+            return
+
+    # Админ: быстрая заморозка (freeze_quick_{sub_id})
+    if data.startswith("freeze_quick_"):
+        sid = _extract_int(data, "freeze_quick_")
         if sid is not None:
-            await handle_admin_sub_freeze(update, context, sid)
+            await handle_freeze_quick(update, context, sid)
+            return
+
+    # Админ: кастомная заморозка (freeze_custom_{sub_id} — ConversationHandler)
+    if data.startswith("freeze_custom_"):
+        sid = _extract_int(data, "freeze_custom_")
+        if sid is not None:
+            await freeze_custom_start(update, context)
             return
 
     if data.startswith("admin_sub_unfreeze_"):
         sid = _extract_int(data, "admin_sub_unfreeze_")
         if sid is not None:
             await handle_admin_sub_unfreeze(update, context, sid)
+            return
+
+    if data.startswith("admin_sub_reset_freezes_"):
+        sid = _extract_int(data, "admin_sub_reset_freezes_")
+        if sid is not None:
+            await handle_admin_sub_reset_freezes(update, context, sid)
             return
 
     # Смена даты окончания (обычно перехватывает ConversationHandler)
@@ -4062,6 +4491,41 @@ def main():
         fallbacks=[CommandHandler("cancel", admin_sub_expires_cancel)],
     )
 
+    # ConversationHandler кастомной заморозки (даты), единый для админа и клиента
+    freeze_custom_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(freeze_custom_start, pattern=r"^freeze_custom$"),
+            CallbackQueryHandler(freeze_custom_start, pattern=r"^freeze_custom_\d+$"),
+        ],
+        states={
+            ADMIN_FREEZE_START: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, freeze_custom_start_date)
+            ],
+            ADMIN_FREEZE_END: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, freeze_custom_end_date)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", freeze_custom_cancel)],
+    )
+
+    # ConversationHandler редактирования профиля (супер-админ)
+    admin_profile_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_profile_start, pattern=r"^admin_profile_edit_\d+$")
+        ],
+        states={
+            ADMIN_PROFILE_FIELD: [
+                CallbackQueryHandler(admin_profile_choose_field, pattern=r"^admin_profile_field_"),
+                CallbackQueryHandler(admin_profile_cancel, pattern=r"^admin_profile_cancel$"),
+            ],
+            ADMIN_PROFILE_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_profile_value),
+                CallbackQueryHandler(admin_profile_cancel, pattern=r"^admin_profile_cancel$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin_profile_cancel)],
+    )
+
     # -----------------------------------------------------------------------
     # Error handler — логирует необработанные исключения
     # -----------------------------------------------------------------------
@@ -4080,6 +4544,8 @@ def main():
     application.add_handler(book_conv)
     application.add_handler(profile_conv)
     application.add_handler(admin_sub_expires_conv)
+    application.add_handler(freeze_custom_conv)
+    application.add_handler(admin_profile_conv)
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
     )
