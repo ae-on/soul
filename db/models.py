@@ -5,6 +5,7 @@
 Каждый класс — обёртка над одной таблицей.
 """
 
+import json
 import logging
 from datetime import date, datetime
 from typing import Any, Optional
@@ -660,6 +661,72 @@ class Subscription(BaseModel):
                 return ok
 
     @classmethod
+    def get_manual_adjustments(cls, sub_id: int) -> int:
+        """
+        Сумма всех неотменённых ручных корректировок (в днях) из audit_log.
+        Записи с флагом "reverted": true исключаются.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT new_value FROM audit_log
+                       WHERE record_id = %s
+                         AND table_name = 'subscriptions'
+                         AND action IN ('add_days', 'shorten_days')""",
+                    (sub_id,),
+                )
+                total = 0
+                for row in cur.fetchall():
+                    try:
+                        payload = json.loads(row["new_value"]) if row["new_value"] else {}
+                        if payload.get("reverted"):
+                            continue
+                        total += int(payload.get("delta", 0))
+                    except (ValueError, TypeError, AttributeError):
+                        pass
+                return total
+
+    @classmethod
+    def reset_manual_adjustments(cls, sub_id: int, admin_id: int) -> bool:
+        """
+        Отменить все ручные корректировки:
+        1. Вычесть накопленную сумму из expires_at.
+        2. Пометить старые записи audit_log как отменённые (reverted=true).
+        3. Записать компенсирующую запись.
+        """
+        total = cls.get_manual_adjustments(sub_id)
+        if total == 0:
+            return False
+
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                # Отнимаем от expires_at накопленную сумму
+                cur.execute(
+                    "UPDATE subscriptions SET expires_at = DATE_ADD(expires_at, INTERVAL -%s DAY) WHERE id = %s",
+                    (total, sub_id),
+                )
+                # Помечаем старые записи как отменённые (MySQL 8+ JSON_SET)
+                cur.execute(
+                    """UPDATE audit_log
+                       SET new_value = JSON_SET(COALESCE(new_value, '{}'), '$.reverted', true)
+                       WHERE record_id = %s
+                         AND table_name = 'subscriptions'
+                         AND action IN ('add_days', 'shorten_days')""",
+                    (sub_id,),
+                )
+                # Компенсирующая запись
+                cur.execute(
+                    """INSERT INTO audit_log (user_id, action, table_name, record_id, new_value)
+                       VALUES (%s, 'reset_manual', 'subscriptions', %s, %s)""",
+                    (admin_id, sub_id, json.dumps({"delta": -total, "reverted": False})),
+                )
+                conn.commit()
+                logger.info(
+                    "Ручные корректировки абонемента %s сброшены (было %+d)", sub_id, total
+                )
+                return True
+
+    @classmethod
     def update_freeze_used(cls, sub_id: int, delta: int = 1) -> bool:
         """Изменить счётчик использованных заморозок на delta (обычно +1)."""
         with get_connection() as conn:
@@ -910,7 +977,7 @@ class Freeze(BaseModel):
                 # Сбрасываем счётчик использованных заморозок
                 cur.execute(
                     """UPDATE subscriptions
-                       SET freeze_used = GREATEST(0, freeze_used - 1)
+                       SET freeze_used = IF(freeze_used > 0, freeze_used - 1, 0)
                        WHERE id = %s""",
                     (sub_id,),
                 )

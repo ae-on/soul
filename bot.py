@@ -2956,35 +2956,55 @@ async def show_admin_sub_manage(
     sub_type = SubscriptionType.get_by_id(sub["type_id"]) if sub.get("type_id") else None
     type_name = sub_type["name"] if sub_type else "Абонемент"
 
+    # --- Остаток часов ---
     hours_left = sub.get("hours_left")
     if hours_left is None:
-        # NULL допустим только у безлимитного тарифа; иначе — ошибка данных
         if sub_type and "безлимит" in (sub_type.get("name") or "").lower():
             hours_line = "Осталось: Безлимит"
         else:
             hours_line = "Осталось: 0ч (ошибка данных)"
     else:
-        hours_total = sub.get("hours_total")
-        hours_line = f"Осталось: {hours_left}ч из {hours_total}ч"
+        hours_left_f = float(hours_left)
+        # Определяем продолжительность одного занятия (1.0 или 1.5)
+        type_name_lower = (type_name or "").lower()
+        per_class = 1.5 if "1.5" in type_name_lower else 1.0
+        classes = int(hours_left_f / per_class)
+        hours_line = f"Осталось: {hours_left_f}ч ({classes} зан.)"
 
-    # Активная заморозка — для строки статуса и кнопок
+    # --- Период ---
+    started_at = sub.get("started_at")
+    expires_at = sub.get("expires_at")
+    period_line = (
+        f"Период: {_format_date(started_at)} — {_format_date(expires_at)}"
+    )
+
+    # --- Активная заморозка ---
     active_freeze = Freeze.get_active_for_subscription(sub_id)
     if active_freeze:
+        freeze_days = active_freeze.get("days") or 0
         freeze_line = (
             f"\U0001f9ca Активная заморозка: "
             f"с {_format_date(active_freeze['start_date'])} "
             f"по {_format_date(active_freeze['end_date'])} "
-            f"({active_freeze.get('days') or 0} дней)"
+            f"(+{freeze_days} дней к сроку)"
         )
     else:
         freeze_line = "\U0001f9ca Заморозка не активна."
 
-    text = (
-        f"\u2699\ufe0f Управление: {type_name}\n"
-        f"{hours_line}\n"
-        f"Действует до: {_format_date(sub.get('expires_at'))}\n"
-        f"{freeze_line}"
-    )
+    # --- Ручные корректировки ---
+    adj_total = Subscription.get_manual_adjustments(sub_id)
+    if adj_total > 0:
+        adj_line = f"\U0001f4dd Ручные корректировки: +{adj_total} дней"
+    elif adj_total < 0:
+        adj_line = f"\U0001f4dd Ручные корректировки: {adj_total} дней"
+    else:
+        adj_line = ""  # ничего не выводим если корректировок нет
+
+    # --- Собираем текст ---
+    lines = [f"\u2699\ufe0f Управление: {type_name}", hours_line, period_line, freeze_line]
+    if adj_line:
+        lines.append(adj_line)
+    text = "\n".join(lines)
     if notice:
         text = f"{notice}\n\n{text}"
 
@@ -3068,6 +3088,17 @@ async def show_admin_sub_manage(
             )
         ]
     )
+
+    # Сброс ручных корректировок — только если они есть
+    if adj_total != 0:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f504 Сбросить корректировки",
+                    callback_data=f"admin_sub_reset_manual_{sub_id}",
+                )
+            ]
+        )
 
     keyboard.append(
         [
@@ -3371,11 +3402,20 @@ async def freeze_custom_end_date(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Абонемент не найден.")
         return ConversationHandler.END
 
+    # Абонемент не должен быть истёкшим
+    if sub.get("expires_at"):
+        exp_check = sub["expires_at"].date() if isinstance(sub["expires_at"], datetime) else sub["expires_at"]
+        if exp_check <= date.today():
+            await update.message.reply_text("\u26a0\ufe0f Абонемент уже истёк, заморозка невозможна.")
+            return ConversationHandler.END
+
     # Максимальная дата окончания: start + 14 дней, но не позже expires_at
     max_end = start + timedelta(days=FREEZE_MAX_DAYS)
     if sub.get("expires_at"):
         exp_date = sub["expires_at"].date() if isinstance(sub["expires_at"], datetime) else sub["expires_at"]
         max_end = min(max_end, exp_date)
+
+    max_days = (max_end - start).days
 
     if end is None:
         # «-» = максимальный срок
@@ -3388,7 +3428,9 @@ async def freeze_custom_end_date(update: Update, context: ContextTypes.DEFAULT_T
             return ADMIN_FREEZE_END
         if end > max_end:
             await update.message.reply_text(
-                f"\u26a0\ufe0f Максимальная дата: {_format_date(max_end)}. Введите ещё раз:"
+                f"\u26a0\ufe0f Нельзя заморозить больше, чем осталось дней в абонементе. "
+                f"Максимум: {max_days} {_plural_days(max_days)} (до {_format_date(max_end)}). "
+                f"Введите ещё раз:"
             )
             return ADMIN_FREEZE_END
 
@@ -3520,8 +3562,29 @@ async def handle_admin_sub_reset_freezes(
         update,
         context,
         sub_id,
-        notice="\u2705 Все заморозки отменены.",
+        notice="✅ Все заморозки отменены.",
     )
+
+
+async def handle_admin_sub_reset_manual(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
+):
+    """Сброс ручных корректировок абонемента: восстановление исходного срока."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    if not Subscription.reset_manual_adjustments(sub_id, admin["id"]):
+        await safe_answer(query, "Нет ручных корректировок для сброса", show_alert=True)
+        await show_admin_sub_manage(update, context, sub_id)
+        return
+
+    logger.info("Админ %s сбросил ручные корректировки абонемента %s", admin["id"], sub_id)
+    await safe_answer(
+        query, "\u2705 Ручные корректировки сброшены. Срок действия восстановлен.", show_alert=True
+    )
+    await show_admin_sub_manage(update, context, sub_id)
 
 
 async def handle_admin_sub_unfreeze(
@@ -3535,7 +3598,9 @@ async def handle_admin_sub_unfreeze(
 
     freeze = Freeze.get_active_for_subscription(sub_id)
     if not freeze:
-        await safe_answer(query, "Активная заморозка не найдена", show_alert=True)
+        await safe_answer(
+            query, "Нет активной заморозки для снятия.", show_alert=True
+        )
         return
 
     # Завершаем заморозку единой функцией: корректировка срока + сброс freeze_used
@@ -4276,6 +4341,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sid = _extract_int(data, "admin_sub_reset_freezes_")
         if sid is not None:
             await handle_admin_sub_reset_freezes(update, context, sid)
+            return
+
+    if data.startswith("admin_sub_reset_manual_"):
+        sid = _extract_int(data, "admin_sub_reset_manual_")
+        if sid is not None:
+            await handle_admin_sub_reset_manual(update, context, sid)
             return
 
     # Смена даты окончания (обычно перехватывает ConversationHandler)
