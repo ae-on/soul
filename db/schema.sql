@@ -114,10 +114,12 @@ CREATE TABLE IF NOT EXISTS events_cache (
     location_id     INT UNSIGNED DEFAULT NULL,
     location_name   VARCHAR(100) DEFAULT NULL,
     category_slug   VARCHAR(100) DEFAULT NULL,
+    teacher_id      INT UNSIGNED DEFAULT NULL COMMENT 'Кто ведёт (users.id)',
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
     UNIQUE INDEX idx_em_event_id (em_event_id),
-    INDEX idx_start_date (start_date)
+    INDEX idx_start_date (start_date),
+    INDEX idx_teacher_id (teacher_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------------

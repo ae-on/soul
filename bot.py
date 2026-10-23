@@ -36,6 +36,7 @@ from db.constants import CONSENT_TEXT, CONSENT_TEXT_VERSION
 from db.models import (
     AuditLog,
     Booking,
+    EventCache,
     Freeze,
     Group,
     Subscription,
@@ -202,6 +203,86 @@ async def get_upcoming_events() -> list[dict]:
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         logger.error("Ошибка при получении расписания из WP: %s", e)
         return []
+
+
+async def sync_events_cache() -> int:
+    """
+    Синхронизирует events_cache с EM API: получает события, определяет
+    teacher_id (из owner или сопоставления со слотами), upsert в кэш.
+    Возвращает количество обработанных событий.
+    """
+    events = await get_upcoming_events()
+    if not events:
+        return 0
+
+    # Загружаем все слоты для сопоставления по категории+времени
+    all_slots = Group.get_active()  # type: ignore[attr-defined]
+
+    count = 0
+    for ev in events:
+        em_id = ev.get("id")
+        if not em_id:
+            continue
+
+        name = ev.get("name") or ""
+        start_date = ev.get("event_start_date")
+        start_time = ev.get("event_start_time")
+        end_time = ev.get("event_end_time")
+        category_slug = ev.get("category_slug") or ""
+        location_id = ev.get("location_id")
+        location_name = ev.get("location_name") or ""
+
+        # Пытаемся определить teacher_id
+        teacher_id = None
+
+        # 1. Из owner события (если EM API передаёт владельца)
+        owner = ev.get("owner") or {}
+        if isinstance(owner, dict):
+            owner_name = owner.get("name") or ""
+            if owner_name:
+                # Ищем пользователя по full_name (простейшее сопоставление)
+                user = User.get_by_field(full_name=owner_name)
+                if user:
+                    roles = UserRole.get_active_roles(user[0]["id"])
+                    if "teacher" in roles or "admin" in roles:
+                        teacher_id = user[0]["id"]
+        elif isinstance(owner, str) and owner:
+            user = User.get_by_field(full_name=owner)
+            if user:
+                roles = UserRole.get_active_roles(user[0]["id"])
+                if "teacher" in roles or "admin" in roles:
+                    teacher_id = user[0]["id"]
+
+        # 2. Если не нашли по owner — сопоставляем со слотами
+        if teacher_id is None and start_time and category_slug:
+            # Приводим время из EM (может быть "18:00:00" или "18:00") к формату для сравнения
+            ev_time_str = str(start_time)[:5]
+            for slot in all_slots:
+                slot_time = _format_time(slot.get("time_start"))
+                if slot_time == ev_time_str and slot.get("category_slug") == category_slug:
+                    teacher_id = slot.get("teacher_id")
+                    if teacher_id:
+                        break
+
+        # Upsert в кэш
+        try:
+            EventCache.upsert(
+                em_event_id=em_id,
+                name=name,
+                start_date=start_date,
+                start_time=start_time,
+                end_time=end_time,
+                location_id=location_id,
+                location_name=location_name,
+                category_slug=category_slug,
+                teacher_id=teacher_id,
+            )
+            count += 1
+        except Exception as e:
+            logger.error("Ошибка при сохранении события %s: %s", em_id, e)
+
+    logger.info("Синхронизация кэша событий: %d обработано", count)
+    return count
 
 
 def filter_events_by_period(events: list[dict], period: str) -> list[dict]:
@@ -2158,6 +2239,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [InlineKeyboardButton("\U0001f465 Клиенты", callback_data="admin_clients")],
+        [InlineKeyboardButton("\U0001f4c5 Слоты и группы", callback_data="admin_slots")],
         [InlineKeyboardButton("\U0001f9d1\u200d\U0001f3eb Учителя", callback_data="admin_teachers")],
         [InlineKeyboardButton("\U0001f527 Админы", callback_data="admin_admins")],
         [InlineKeyboardButton("\U0001f519 Главное меню", callback_data="back_to_main")],
@@ -2375,6 +2457,214 @@ async def show_admin_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append(
         [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")]
     )
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+
+# ----------------------------------------------------------------------
+# Админка: управление слотами (группами)
+# ----------------------------------------------------------------------
+SLOTS_PER_PAGE = 10
+
+
+async def show_admin_slots(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1
+):
+    """Список всех слотов с пагинацией."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    total = Group.count_all()
+    total_pages = max(1, math.ceil(total / SLOTS_PER_PAGE))
+    if page < 1:
+        page = 1
+    if page > total_pages:
+        page = total_pages
+
+    offset = (page - 1) * SLOTS_PER_PAGE
+    slots = Group.get_all_with_teachers(limit=SLOTS_PER_PAGE, offset=offset)
+
+    if not slots:
+        text = "\U0001f4c5 Слоты и группы\n\nНет слотов."
+        keyboard = [
+            [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")]
+        ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    lines = [f"\U0001f4c5 Слоты и группы (Всего: {total})", ""]
+    keyboard = []
+    for slot in slots:
+        name = slot.get("name") or slot.get("category_slug") or "Слот"
+        time_str = _format_time(slot.get("time_start"))
+        teacher_name = slot.get("teacher_name") or "Не назначен"
+        lines.append(f"• {name} {time_str} — {teacher_name}")
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"\U0001f4c5 {name} {time_str}",
+                    callback_data=f"admin_slot_manage_{slot['id']}",
+                )
+            ]
+        )
+
+    # Пагинация
+    if total_pages > 1:
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("\u2b05\ufe0f", callback_data=f"admin_slots_page_{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+        if page < total_pages:
+            nav.append(InlineKeyboardButton("\u27a1\ufe0f", callback_data=f"admin_slots_page_{page + 1}"))
+        keyboard.append(nav)
+
+        page_buttons = []
+        for p in range(1, total_pages + 1):
+            label = f"[{p}]" if p == page else str(p)
+            page_buttons.append(InlineKeyboardButton(label, callback_data=f"admin_slots_page_{p}"))
+        for i in range(0, len(page_buttons), 5):
+            keyboard.append(page_buttons[i : i + 5])
+
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")]
+    )
+    await _safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(keyboard))
+
+
+async def show_admin_slot_manage(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, slot_id: int
+):
+    """Управление конкретным слотом."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    slot = Group.get_by_id(slot_id)
+    if not slot:
+        await safe_answer(query, "Слот не найден", show_alert=True)
+        return
+
+    # Получаем имя преподавателя
+    teacher_name = "Не назначен"
+    if slot.get("teacher_id"):
+        teacher = User.get_by_id(slot["teacher_id"])
+        if teacher:
+            teacher_name = teacher.get("full_name") or teacher.get("username") or str(slot["teacher_id"])
+
+    weekdays_map = {"1": "Пн", "2": "Вт", "3": "Ср", "4": "Чт", "5": "Пт", "6": "Сб", "7": "Вс"}
+    weekdays_str = ", ".join(
+        weekdays_map.get(d.strip(), d.strip())
+        for d in (slot.get("weekdays") or "").split(",")
+        if d.strip()
+    )
+
+    text = (
+        f"\u2699\ufe0f Слот: {slot.get('name') or slot.get('category_slug') or '—'}\n"
+        f"\U0001f550 Время: {_format_time(slot.get('time_start'))} — {_format_time(slot.get('time_end'))} ({weekdays_str})\n"
+        f"\U0001f9d1\u200d\U0001f3eb Преподаватель: {teacher_name}"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\U0001f9d1\u200d\U0001f3eb Назначить преподавателя",
+                callback_data=f"admin_slot_assign_{slot_id}",
+            )
+        ],
+        [InlineKeyboardButton("\U0001f519 К списку слотов", callback_data="admin_slots")],
+    ]
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+
+async def show_admin_slot_assign(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, slot_id: int
+):
+    """Список преподавателей для назначения на слот."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    slot = Group.get_by_id(slot_id)
+    if not slot:
+        await safe_answer(query, "Слот не найден", show_alert=True)
+        return
+
+    teachers = User.get_by_role("teacher", limit=100, offset=0, status_filter="all")
+
+    if not teachers:
+        text = "Нет пользователей с ролью teacher."
+        keyboard = [
+            [InlineKeyboardButton("\U0001f519 Назад", callback_data=f"admin_slot_manage_{slot_id}")]
+        ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    lines = [
+        "\U0001f9d1\u200d\U0001f3eb Назначение преподавателя",
+        f"Слот: {slot.get('name') or slot.get('category_slug') or '—'}",
+        "",
+    ]
+    keyboard = []
+    for t in teachers:
+        name = t.get("full_name") or t.get("username") or f"ID {t.get('telegram_id')}"
+        lines.append(f"• {name}")
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"\U0001f9d1\u200d\U0001f3eb {name}",
+                    callback_data=f"admin_slot_set_teacher_{slot_id}_{t['id']}",
+                )
+            ]
+        )
+
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data=f"admin_slot_manage_{slot_id}")]
+    )
+    await _safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(keyboard))
+
+
+async def handle_admin_slot_set_teacher(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, slot_id: int, teacher_id: int
+):
+    """Назначить преподавателя на слот."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    try:
+        Group.update(slot_id, teacher_id=teacher_id)
+        logger.info(
+            "Админ %s назначил преподавателя %s на слот %s",
+            admin["id"], teacher_id, slot_id,
+        )
+        await safe_answer(query, "\u2705 Преподаватель назначен", show_alert=True)
+    except Exception as e:
+        logger.error("Ошибка при назначении преподавателя: %s", e)
+        await safe_answer(query, "Ошибка при назначении", show_alert=True)
+
+    await show_admin_slot_manage(update, context, slot_id)
+
+
+async def show_admin_slot_create_stub(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Заглушка создания слота."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    text = (
+        "\u2795 Создание слотов\n\n"
+        "Создание слотов через админку появится в ближайшее время.\n"
+        "Пока добавляйте их через базу данных."
+    )
+    keyboard = [
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_slots")]
+    ]
     await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
 
@@ -3895,56 +4185,38 @@ async def show_teacher_panel(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def show_teacher_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Слоты преподавателя на текущий день недели."""
+    """Занятия преподавателя на сегодня из events_cache (по teacher_id)."""
     teacher = await _require_teacher(update, context)
     if not teacher:
         return
     query = update.callback_query
 
-    # date.isoweekday(): 1=Пн ... 7=Вс — совпадает с форматом weekdays в БД
-    weekday = date.today().isoweekday()
+    events = EventCache.get_by_teacher_today(teacher["id"])
 
-    # Слоты преподавателя, отфильтрованные по дню недели
-    today_slots = []
-    for slot in Group.get_by_teacher(teacher["id"]):
-        days = [
-            d.strip()
-            for d in (slot.get("weekdays") or "").split(",")
-            if d.strip()
-        ]
-        if str(weekday) in days:
-            today_slots.append(slot)
-
-    if not today_slots:
+    if not events:
         text = "\U0001f4c5 Мои занятия сегодня\n\nУ вас нет занятий сегодня."
         keyboard = [
             [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_panel")]
         ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
         return
 
     lines = ["\U0001f4c5 Мои занятия сегодня", ""]
     keyboard = []
-    for slot in today_slots:
-        time_str = _format_time(slot.get("time_start"))
-        name = slot.get("name") or slot.get("category_slug") or "Занятие"
-        location = slot.get("location_id") or "—"
-
-        # Пока слоты не связаны с событиями EM — количество записей недоступно
-        em_event_id = slot.get("em_event_id")
-        if em_event_id:
-            count = Booking.count_confirmed_for_event(em_event_id)
-            count_str = f"{count} чел."
-        else:
-            count_str = "—"
+    for ev in events:
+        time_str = _format_time(ev.get("start_time"))
+        name = ev.get("name") or "Занятие"
+        location = ev.get("location_name") or ev.get("location_id") or "—"
+        em_id = ev.get("em_event_id")
+        count = Booking.count_confirmed_for_event(em_id) if em_id else 0
 
         lines.append(f"\U0001f555 {time_str} — {name} (Зал {location})")
-        lines.append(f"Записано: {count_str}")
+        lines.append(f"Записано: {count} чел.")
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    "\U0001f465 Список",
-                    callback_data=f"teacher_slot_{slot['id']}",
+                    "\U0001f465 Список группы",
+                    callback_data=f"teacher_class_{em_id}",
                 )
             ]
         )
@@ -3952,9 +4224,7 @@ async def show_teacher_today(update: Update, context: ContextTypes.DEFAULT_TYPE)
     keyboard.append(
         [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_panel")]
     )
-    await query.edit_message_text(
-        "\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await _safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(keyboard))
 
 
 async def show_teacher_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3968,48 +4238,134 @@ async def show_teacher_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_panel")]
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
 
-async def show_teacher_slot(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, slot_id: int
+async def show_teacher_class(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, em_event_id: int
 ):
-    """Список записавшихся на слот (заглушка до интеграции с EM)."""
+    """Список записавшихся на занятие с кнопками отметки."""
     teacher = await _require_teacher(update, context)
     if not teacher:
         return
     query = update.callback_query
 
-    slot = Group.get_by_id(slot_id)
-    if not slot:
-        await safe_answer(query, "Слот не найден", show_alert=True)
+    bookings = Booking.get_by_event(em_event_id) if em_event_id else []
+    ev = EventCache.get_by_id(em_event_id) if em_event_id else None  # нет, em_event_id != PK
+
+    time_str = ""
+    ev_name = "Занятие"
+    if em_event_id:
+        # Достаём событие из кэша по em_event_id
+        for e in EventCache.get_by_teacher_today(teacher["id"]):
+            if e.get("em_event_id") == em_event_id:
+                time_str = _format_time(e.get("start_time"))
+                ev_name = e.get("name") or "Занятие"
+                break
+
+    if not bookings:
+        text = f"\U0001f465 Группа на {time_str or ev_name}\n\nНет записей."
+        keyboard = [
+            [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_today")]
+        ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
         return
 
-    # Если у слота появится привязка к событию EM — покажем реальные записи
-    em_event_id = slot.get("em_event_id")
-    if em_event_id:
-        bookings = Booking.get_by_event(em_event_id)
-        if bookings:
-            lines = ["\U0001f465 Записи на занятие", ""]
-            for b in bookings:
-                who = b.get("full_name") or b.get("username") or f"ID {b.get('user_id')}"
-                lines.append(f"• {who}")
-            text = "\n".join(lines)
-            keyboard = [
-                [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_today")]
-            ]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-            return
-
-    text = (
-        "\U0001f465 Записи на занятие\n\n"
-        "Интеграция со списком записей появится позже. Пока вы можете "
-        "отметить посещение вручную."
-    )
-    keyboard = [
-        [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_today")]
+    lines = [
+        f"\U0001f465 Группа на {time_str or ev_name} (Записано: {len(bookings)})",
+        "",
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = []
+    for i, b in enumerate(bookings, 1):
+        who = b.get("full_name") or b.get("username") or f"ID {b.get('user_id')}"
+        lines.append(f"{i}. {who}")
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"\u2705 {who}",
+                    callback_data=f"teacher_mark_{b['id']}",
+                )
+            ]
+        )
+
+    text = "\n".join(lines)
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_today")]
+    )
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+
+async def handle_teacher_mark(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, booking_id: int
+):
+    """Отметить посещение из списка группы (преподаватель)."""
+    teacher = await _require_teacher(update, context)
+    if not teacher:
+        return
+    query = update.callback_query
+
+    # Получаем booking
+    booking = Booking.get_by_id(booking_id)
+    if not booking or booking["status"] not in ("registered", "confirmed"):
+        await safe_answer(query, "Запись уже обработана", show_alert=True)
+        return
+
+    em_event_id = booking.get("em_event_id")
+    user_id = booking.get("user_id")
+
+    # Находим активный абонемент клиента
+    sub = Subscription.get_active_for_user(user_id)
+    if not sub:
+        await safe_answer(query, "У клиента нет активного абонемента", show_alert=True)
+        return
+
+    # Списание часов (по умолчанию 1.0, но можно 1.5 если в событии длительность)
+    hours = 1.0
+    if em_event_id:
+        for e in EventCache.get_by_teacher_today(teacher["id"]):
+            if e.get("em_event_id") == em_event_id:
+                if e.get("end_time") and e.get("start_time"):
+                    try:
+                        dur = (
+                            datetime.combine(date.min, e["end_time"]) 
+                            - datetime.combine(date.min, e["start_time"])
+                        ).total_seconds() / 3600
+                        hours = round(dur, 1)
+                    except Exception:
+                        pass
+                break
+
+    if not Subscription.update_hours(sub["id"], -hours):
+        await safe_answer(query, "Не удалось списать часы", show_alert=True)
+        return
+
+    # Меняем статус booking на attended
+    Booking.update(booking_id, status="attended")
+
+    # Создаём visit
+    Visit.create(
+        user_id=user_id,
+        em_event_id=em_event_id or 0,
+        subscription_id=sub["id"],
+        marked_at=datetime.now(),
+        marked_by=teacher["id"],
+        method="manual_teacher",
+        visit_type="subscription",
+        status="attended",
+        hours_charged=hours,
+    )
+
+    logger.info(
+        "Преподаватель %s отметил посещение booking %s: %sч",
+        teacher["id"], booking_id, hours,
+    )
+
+    await safe_answer(query, f"\u2705 Посещение отмечено ({hours}ч)", show_alert=True)
+    # Возвращаемся к списку группы
+    if em_event_id:
+        await show_teacher_class(update, context, em_event_id)
+    else:
+        await show_teacher_today(update, context)
 
 
 # ----------------------------------------------------------------------
@@ -4213,6 +4569,49 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_admin_admins(update, context)
         return
 
+    # --- Админка: слоты ---
+    if data == "admin_slots":
+        await show_admin_slots(update, context)
+        return
+
+    if data.startswith("admin_slots_page_"):
+        try:
+            page = int(data[len("admin_slots_page_"):])
+        except ValueError:
+            page = 1
+        if page < 1:
+            page = 1
+        await show_admin_slots(update, context, page=page)
+        return
+
+    if data.startswith("admin_slot_manage_"):
+        sid = _extract_int(data, "admin_slot_manage_")
+        if sid is not None:
+            await show_admin_slot_manage(update, context, sid)
+            return
+
+    if data.startswith("admin_slot_assign_"):
+        sid = _extract_int(data, "admin_slot_assign_")
+        if sid is not None:
+            await show_admin_slot_assign(update, context, sid)
+            return
+
+    if data.startswith("admin_slot_set_teacher_"):
+        # Формат: admin_slot_set_teacher_{slot_id}_{teacher_id}
+        parts = data[len("admin_slot_set_teacher_"):].split("_", 1)
+        if len(parts) == 2:
+            try:
+                sid = int(parts[0])
+                tid = int(parts[1])
+                await handle_admin_slot_set_teacher(update, context, sid, tid)
+                return
+            except ValueError:
+                pass
+
+    if data == "admin_slot_create":
+        await show_admin_slot_create_stub(update, context)
+        return
+
     # Заглушка для неинтерактивных кнопок-индикаторов
     if data == "noop":
         return
@@ -4400,10 +4799,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_teacher_week(update, context)
         return
 
-    if data.startswith("teacher_slot_"):
-        slot_id = _extract_int(data, "teacher_slot_")
-        if slot_id is not None:
-            await show_teacher_slot(update, context, slot_id)
+    if data.startswith("teacher_class_"):
+        eid = _extract_int(data, "teacher_class_")
+        if eid is not None:
+            await show_teacher_class(update, context, eid)
+            return
+
+    if data.startswith("teacher_mark_"):
+        bid = _extract_int(data, "teacher_mark_")
+        if bid is not None:
+            await handle_teacher_mark(update, context, bid)
             return
 
     # --- Остальные пункты ---

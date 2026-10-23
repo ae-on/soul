@@ -994,6 +994,37 @@ class Freeze(BaseModel):
 class EventCache(BaseModel):
     TABLE = "events_cache"
 
+    @classmethod
+    def get_by_teacher_today(cls, teacher_id: int) -> list[dict]:
+        """События на сегодня для преподавателя."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM events_cache
+                       WHERE teacher_id = %s
+                         AND start_date = CURDATE()
+                       ORDER BY start_time""",
+                    (teacher_id,),
+                )
+                return cur.fetchall()
+
+    @classmethod
+    def upsert(cls, em_event_id: int, **kwargs) -> bool:
+        """Вставить или обновить событие в кэше."""
+        cols = ", ".join(kwargs.keys())
+        vals = ", ".join(f"%s" for _ in kwargs)
+        updates = ", ".join(f"{k} = VALUES({k})" for k in kwargs)
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""INSERT INTO events_cache (em_event_id, {cols})
+                       VALUES (%s, {vals})
+                       ON DUPLICATE KEY UPDATE {updates}""",
+                    (em_event_id, *kwargs.values()),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+
 
 class Booking(BaseModel):
     TABLE = "bookings"
@@ -1253,3 +1284,27 @@ class Group(BaseModel):
         time_end = kwargs.pop("time_end")
         kwargs["duration_hours"] = cls.calculate_duration(time_start, time_end)
         return cls.create(**kwargs)
+
+    @classmethod
+    def get_all_with_teachers(cls, limit: int = 10, offset: int = 0) -> list[dict]:
+        """Все слоты с именем преподавателя (LEFT JOIN users)."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT s.*, u.full_name AS teacher_name
+                       FROM slots s
+                       LEFT JOIN users u ON u.id = s.teacher_id
+                       ORDER BY s.category_slug, s.time_start
+                       LIMIT %s OFFSET %s""",
+                    (limit, offset),
+                )
+                return cur.fetchall()
+
+    @classmethod
+    def count_all(cls) -> int:
+        """Количество всех слотов."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute("SELECT COUNT(*) AS cnt FROM slots")
+                row = cur.fetchone()
+                return row["cnt"] if row else 0
