@@ -316,6 +316,33 @@ class User(BaseModel):
                 return row["cnt"] if row else 0
 
     @classmethod
+    def find_teacher_id(cls, email: str = None, name: str = None) -> Optional[int]:
+        """
+        Находит ID пользователя по email (точно) или по full_name
+        (LIKE, первое совпадение). Возвращает None, если не найден.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                if email:
+                    cur.execute(
+                        "SELECT id FROM users WHERE email = %s LIMIT 1", (email,)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row["id"]
+                if name:
+                    cur.execute(
+                        """SELECT id FROM users
+                           WHERE full_name LIKE %s
+                           LIMIT 1""",
+                        (f"%{name}%",),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row["id"]
+                return None
+
+    @classmethod
     def get_history(cls, user_id: int, limit: int = 20) -> list[dict]:
         """
         Объединённая история пользователя: покупки, заморозки, посещения.
@@ -1009,6 +1036,35 @@ class EventCache(BaseModel):
                 return cur.fetchall()
 
     @classmethod
+    def get_by_teacher_period(
+        cls, teacher_id: int, start: date, end: date
+    ) -> list[dict]:
+        """События преподавателя в диапазоне дат, по дате и времени."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM events_cache
+                       WHERE teacher_id = %s
+                         AND start_date BETWEEN %s AND %s
+                       ORDER BY start_date, start_time""",
+                    (teacher_id, start, end),
+                )
+                return cur.fetchall()
+
+    @classmethod
+    def get_by_em_event(cls, em_event_id: int) -> Optional[dict]:
+        """Событие из кэша по ID события EM."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM events_cache
+                       WHERE em_event_id = %s
+                       LIMIT 1""",
+                    (em_event_id,),
+                )
+                return cur.fetchone()
+
+    @classmethod
     def upsert(cls, em_event_id: int, **kwargs) -> bool:
         """Вставить или обновить событие в кэше."""
         cols = ", ".join(kwargs.keys())
@@ -1060,10 +1116,12 @@ class Booking(BaseModel):
         with get_connection() as conn:
             with conn.cursor(DictCursor) as cur:
                 cur.execute(
-                    """SELECT b.*, u.full_name, u.phone, u.username
+                    """SELECT b.id, b.user_id, b.status, b.hours_charged,
+                              u.full_name, u.phone, u.username
                        FROM bookings b
                        JOIN users u ON u.id = b.user_id
                        WHERE b.em_event_id = %s
+                         AND b.status IN ('registered', 'confirmed')
                        ORDER BY b.created_at""",
                     (em_event_id,),
                 )
@@ -1283,6 +1341,9 @@ class Group(BaseModel):
         time_start = kwargs.pop("time_start")
         time_end = kwargs.pop("time_end")
         kwargs["duration_hours"] = cls.calculate_duration(time_start, time_end)
+        # Возвращаем время обратно — оно нужно для INSERT в slots
+        kwargs["time_start"] = time_start
+        kwargs["time_end"] = time_end
         return cls.create(**kwargs)
 
     @classmethod

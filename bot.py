@@ -54,15 +54,29 @@ from handlers.student import (
     sync_events_cache,
 )
 from handlers.admin import (
+    ADMIN_EMAIL_EDIT,
     ADMIN_FREEZE_START,
     ADMIN_FREEZE_END,
     ADMIN_PROFILE_FIELD,
     ADMIN_PROFILE_VALUE,
     ADMIN_SUB_EXPIRES_DATE,
+    ASK_SLOT_NAME,
+    ASK_SLOT_WEEKDAYS,
+    ASK_SLOT_TIME_START,
+    ASK_SLOT_TIME_END,
     admin_profile_cancel,
     admin_profile_choose_field,
     admin_profile_start,
     admin_profile_value,
+    admin_slot_ask_time_end,
+    admin_slot_ask_time_start,
+    admin_slot_ask_weekdays,
+    admin_slot_create_cancel,
+    admin_slot_create_start,
+    admin_slot_finish,
+    admin_email_edit_cancel,
+    admin_email_edit_start,
+    admin_email_edit_value,
     admin_sub_expires_cancel,
     admin_sub_expires_date,
     admin_sub_expires_handler,
@@ -155,6 +169,42 @@ def main():
         fallbacks=[CommandHandler("cancel", admin_profile_cancel)],
     )
 
+    # ConversationHandler создания слота (админка)
+    admin_slot_create_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_slot_create_start, pattern=r"^admin_slot_create$")
+        ],
+        states={
+            ASK_SLOT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_slot_ask_weekdays)
+            ],
+            ASK_SLOT_WEEKDAYS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_slot_ask_time_start)
+            ],
+            ASK_SLOT_TIME_START: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_slot_ask_time_end)
+            ],
+            ASK_SLOT_TIME_END: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_slot_finish)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin_slot_create_cancel)],
+    )
+
+    # ConversationHandler редактирования email пользователя (админка)
+    admin_email_edit_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_email_edit_start, pattern=r"^admin_user_email_\d+$")
+        ],
+        states={
+            ADMIN_EMAIL_EDIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_email_edit_value),
+                CallbackQueryHandler(admin_email_edit_cancel, pattern=r"^admin_email_cancel$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin_email_edit_cancel)],
+    )
+
     # -----------------------------------------------------------------------
     # Error handler
     # -----------------------------------------------------------------------
@@ -175,6 +225,8 @@ def main():
     application.add_handler(admin_sub_expires_conv)
     application.add_handler(freeze_custom_conv)
     application.add_handler(admin_profile_conv)
+    application.add_handler(admin_slot_create_conv)
+    application.add_handler(admin_email_edit_conv)
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
     )

@@ -67,6 +67,9 @@ ADMIN_FREEZE_START, ADMIN_FREEZE_END = 11, 12
 # Состояния диалога редактирования профиля (супер-админ)
 ADMIN_PROFILE_FIELD, ADMIN_PROFILE_VALUE = 13, 14
 
+# Состояния диалога создания слота
+ASK_SLOT_NAME, ASK_SLOT_WEEKDAYS, ASK_SLOT_TIME_START, ASK_SLOT_TIME_END = 15, 16, 17, 18
+
 
 # ----------------------------------------------------------------------
 # Админ-панель
@@ -286,9 +289,13 @@ async def show_admin_slots(
     if not slots:
         text = "\U0001f4c5 Слоты и группы\n\nНет слотов."
         keyboard = [
-            [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")]
+            [InlineKeyboardButton("\u2795 Создать слот", callback_data="admin_slot_create")],
+            [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")],
         ]
-        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        if query:
+            await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        else:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     lines = [f"\U0001f4c5 Слоты и группы (Всего: {total})", ""]
@@ -325,9 +332,17 @@ async def show_admin_slots(
             keyboard.append(page_buttons[i : i + 5])
 
     keyboard.append(
+        [InlineKeyboardButton("\u2795 Создать слот", callback_data="admin_slot_create")]
+    )
+    keyboard.append(
         [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")]
     )
-    await _safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(keyboard))
+    if query:
+        await _safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(
+            "\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 
 async def show_admin_slot_manage(
@@ -446,24 +461,161 @@ async def handle_admin_slot_set_teacher(
     await show_admin_slot_manage(update, context, slot_id)
 
 
-async def show_admin_slot_create_stub(
+async def admin_slot_create_start(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    """Заглушка создания слота."""
+    """Шаг 1 — создание слота: запрос названия."""
     admin = await _require_admin(update, context)
     if not admin:
-        return
+        return ConversationHandler.END
     query = update.callback_query
 
-    text = (
-        "\u2795 Создание слотов\n\n"
-        "Создание слотов через админку появится в ближайшее время.\n"
-        "Пока добавляйте их через базу данных."
+    context.user_data["slot_new"] = {}
+    await query.edit_message_text(
+        "\u2795 Создание слота\n\n"
+        "Введите название слота (например: Бачата Пн/Ср 18:00):"
     )
-    keyboard = [
-        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_slots")]
-    ]
-    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+    return ASK_SLOT_NAME
+
+
+async def admin_slot_ask_weekdays(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2 — валидация названия, запрос дней недели."""
+    name = update.message.text.strip()
+    if len(name) < 2:
+        await update.message.reply_text(
+            "\u26a0\ufe0f Название слишком короткое. Введите ещё раз:"
+        )
+        return ASK_SLOT_NAME
+
+    context.user_data.setdefault("slot_new", {})["name"] = name
+    await update.message.reply_text(
+        "Введите дни недели цифрами через запятую (1=Пн, 7=Вс, например: 1,3):"
+    )
+    return ASK_SLOT_WEEKDAYS
+
+
+async def admin_slot_ask_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 3 — валидация дней недели, запрос времени начала."""
+    raw = update.message.text.strip()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts or not all(p.isdigit() and 1 <= int(p) <= 7 for p in parts):
+        await update.message.reply_text(
+            "\u26a0\ufe0f Неверный формат. Введите дни недели цифрами 1-7 "
+            "через запятую (например: 1,3):"
+        )
+        return ASK_SLOT_WEEKDAYS
+
+    context.user_data.setdefault("slot_new", {})["weekdays"] = ",".join(parts)
+    await update.message.reply_text(
+        "Введите время начала (ЧЧ:ММ, например 18:00):"
+    )
+    return ASK_SLOT_TIME_START
+
+
+async def admin_slot_ask_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 4 — валидация времени начала, запрос времени окончания."""
+    raw = update.message.text.strip()
+    try:
+        start_dt = datetime.strptime(raw, "%H:%M")
+    except ValueError:
+        await update.message.reply_text(
+            "\u26a0\ufe0f Неверный формат времени. Введите ЧЧ:ММ (например 18:00):"
+        )
+        return ASK_SLOT_TIME_START
+
+    context.user_data.setdefault("slot_new", {})["time_start"] = start_dt.strftime(
+        "%H:%M:%S"
+    )
+    await update.message.reply_text(
+        "Введите время окончания (ЧЧ:ММ, например 19:30):"
+    )
+    return ASK_SLOT_TIME_END
+
+
+async def admin_slot_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 5 — валидация времени окончания, сохранение слота."""
+    raw = update.message.text.strip()
+    try:
+        end_dt = datetime.strptime(raw, "%H:%M")
+    except ValueError:
+        await update.message.reply_text(
+            "\u26a0\ufe0f Неверный формат времени. Введите ЧЧ:ММ (например 19:30):"
+        )
+        return ASK_SLOT_TIME_END
+
+    data = context.user_data.get("slot_new") or {}
+    start_str = data.get("time_start")
+    if not start_str:
+        await update.message.reply_text("Диалог устарел. Начните заново.")
+        return ConversationHandler.END
+
+    start_dt = datetime.strptime(start_str, "%H:%M:%S")
+    if end_dt <= start_dt:
+        await update.message.reply_text(
+            "\u26a0\ufe0f Время окончания должно быть позже времени начала. "
+            "Введите ещё раз:"
+        )
+        return ASK_SLOT_TIME_END
+
+    name = data.get("name") or "Слот"
+    weekdays = data.get("weekdays") or ""
+    # category_slug — первое слово названия в нижнем регистре; fallback 'dance'
+    first_word = name.split()[0] if name.split() else ""
+    category_slug = (first_word.lower()[:50]) or "dance"
+
+    # Время в формате HH:MM:00
+    time_start_str = start_dt.strftime("%H:%M:00")
+    time_end_str = end_dt.strftime("%H:%M:00")
+
+    try:
+        Group.create_with_duration(
+            name=name,
+            category_slug=category_slug,
+            weekdays=weekdays,
+            time_start=time_start_str,
+            time_end=time_end_str,
+            active=1,
+        )
+        logger.info(
+            "Админ создал слот: %s (%s, %s-%s)",
+            name,
+            weekdays,
+            time_start_str,
+            time_end_str,
+        )
+        await update.message.reply_text(f"\u2705 Слот '{name}' успешно создан!")
+    except Exception as e:
+        logger.error(
+            "Ошибка при создании слота: %s | данные: name=%r, category_slug=%r, "
+            "weekdays=%r, time_start=%r, time_end=%r",
+            e,
+            name,
+            category_slug,
+            weekdays,
+            time_start_str,
+            time_end_str,
+        )
+        await update.message.reply_text(
+            "\u26a0\ufe0f Не удалось создать слот. Попробуйте позже."
+        )
+
+    context.user_data.pop("slot_new", None)
+    await show_admin_slots(update, context)
+    return ConversationHandler.END
+
+
+async def admin_slot_create_cancel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Отмена создания слота."""
+    context.user_data.pop("slot_new", None)
+    if update.callback_query:
+        await safe_answer(update.callback_query)
+        await update.callback_query.edit_message_text("\u274c Создание слота отменено.")
+    else:
+        await update.message.reply_text("\u274c Создание слота отменено.")
+    await show_admin_slots(update, context)
+    return ConversationHandler.END
 
 
 async def show_admin_user_card(
@@ -500,6 +652,7 @@ async def show_admin_user_card(
         f"Telegram ID: {u['telegram_id']}\n"
         f"Username: @{u['username'] or '—'}\n"
         f"Телефон: {u['phone'] or '—'}\n"
+        f"Email: {u.get('email') or '—'}\n"
         f"Статус: {u['status']}\n"
         f"Роли: {roles_str}\n"
         f"Согласие на ПДн: {consent}\n"
@@ -513,6 +666,11 @@ async def show_admin_user_card(
             ),
             InlineKeyboardButton(
                 "\U0001f4b0 Абонементы", callback_data=f"admin_user_subs_{user_id}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f4e7 Email", callback_data=f"admin_user_email_{user_id}"
             ),
         ],
     ]
@@ -686,6 +844,87 @@ async def admin_profile_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     else:
         await update.message.reply_text("\u2699\ufe0f Редактирование отменено.")
+
+    if user_id:
+        await show_admin_user_card(update, context, user_id)
+    return ConversationHandler.END
+
+
+# ----------------------------------------------------------------------
+# Редактирование email пользователя (для привязки преподавателей)
+# ----------------------------------------------------------------------
+ADMIN_EMAIL_EDIT = 19
+
+
+async def admin_email_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрос нового email для пользователя."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return ConversationHandler.END
+    query = update.callback_query
+
+    try:
+        user_id = int(query.data.replace("admin_user_email_", ""))
+    except (ValueError, AttributeError):
+        await query.edit_message_text("Ошибка: неверный ID пользователя.")
+        return ConversationHandler.END
+
+    target = User.get_by_id(user_id)
+    if not target:
+        await safe_answer(query, "Пользователь не найден", show_alert=True)
+        return ConversationHandler.END
+
+    context.user_data["admin_email_user_id"] = user_id
+    text = (
+        f"\U0001f4e7 Изменение Email\n\n"
+        f"Пользователь: {target.get('full_name') or target.get('username') or user_id}\n"
+        f"Текущий email: {target.get('email') or '—'}\n\n"
+        "Введите новый email:"
+    )
+    keyboard = [[InlineKeyboardButton("\U0001f519 Отмена", callback_data="admin_email_cancel")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return ADMIN_EMAIL_EDIT
+
+
+async def admin_email_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Валидация и сохранение нового email."""
+    value = update.message.text.strip()
+    if not re.match(r"^[^@\s]+@[^@\s]+$", value):
+        await update.message.reply_text(
+            "\u26a0\ufe0f Неверный email. Введите ещё раз:"
+        )
+        return ADMIN_EMAIL_EDIT
+
+    user_id = context.user_data.get("admin_email_user_id")
+    context.user_data.pop("admin_email_user_id", None)
+    if not user_id:
+        await update.message.reply_text("Диалог устарел. Откройте карточку заново.")
+        return ConversationHandler.END
+
+    User.update(user_id, email=value)
+    logger.info(
+        "Админ (telegram %s) изменил email пользователя %s на %s",
+        update.effective_user.id,
+        user_id,
+        value,
+    )
+    await update.message.reply_text(f"\u2705 Email обновлён: {value}")
+    await show_admin_user_card(update, context, user_id)
+    return ConversationHandler.END
+
+
+async def admin_email_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена редактирования email."""
+    user_id = context.user_data.get("admin_email_user_id")
+    context.user_data.pop("admin_email_user_id", None)
+
+    if update.callback_query:
+        await safe_answer(update.callback_query)
+        await update.callback_query.edit_message_text(
+            "\U0001f4e7 Изменение email отменено."
+        )
+    else:
+        await update.message.reply_text("\U0001f4e7 Изменение email отменено.")
 
     if user_id:
         await show_admin_user_card(update, context, user_id)

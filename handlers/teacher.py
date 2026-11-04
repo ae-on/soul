@@ -1,21 +1,20 @@
 """
 Хендлеры панели преподавателя: занятия, группы, отметка посещений.
+Полностью работают на events_cache (расписание с сайта).
 """
 import logging
 from datetime import date, datetime, timedelta
-from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from db.models import Booking, EventCache, Group, Subscription, User, UserRole, Visit
+from db.models import Booking, EventCache, Subscription, User, Visit
 from handlers.helpers import (
+    _format_date,
     _format_time,
     _require_teacher,
     _safe_edit,
     safe_answer,
-    check_and_complete_freeze,
-    notify_admin,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,14 +43,15 @@ async def show_teacher_panel(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ],
         [InlineKeyboardButton("\U0001f519 Главное меню", callback_data="back_to_main")],
     ]
-    await query.edit_message_text(
+    await _safe_edit(
+        query,
         "\U0001f9d1\u200d\U0001f3eb Панель преподавателя",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
 async def show_teacher_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Занятия преподавателя на сегодня из events_cache (по teacher_id)."""
+    """Занятия преподавателя на сегодня (из events_cache по teacher_id)."""
     teacher = await _require_teacher(update, context)
     if not teacher:
         return
@@ -60,7 +60,7 @@ async def show_teacher_today(update: Update, context: ContextTypes.DEFAULT_TYPE)
     events = EventCache.get_by_teacher_today(teacher["id"])
 
     if not events:
-        text = "\U0001f4c5 Мои занятия сегодня\n\nУ вас нет занятий сегодня."
+        text = "\U0001f4c5 Мои занятия сегодня\n\nУ вас нет занятий на сегодня."
         keyboard = [
             [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_panel")]
         ]
@@ -72,20 +72,20 @@ async def show_teacher_today(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for ev in events:
         time_str = _format_time(ev.get("start_time"))
         name = ev.get("name") or "Занятие"
-        location = ev.get("location_name") or ev.get("location_id") or "—"
         em_id = ev.get("em_event_id")
         count = Booking.count_confirmed_for_event(em_id) if em_id else 0
 
-        lines.append(f"\U0001f555 {time_str} — {name} (Зал {location})")
+        lines.append(f"\U0001f555 {time_str} — {name}")
         lines.append(f"Записано: {count} чел.")
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    "\U0001f465 Список группы",
-                    callback_data=f"teacher_class_{em_id}",
-                )
-            ]
-        )
+        if em_id:
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "\U0001f465 Список группы",
+                        callback_data=f"teacher_class_{em_id}",
+                    )
+                ]
+            )
 
     keyboard.append(
         [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_panel")]
@@ -94,40 +94,71 @@ async def show_teacher_today(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def show_teacher_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Расписание преподавателя на неделю — заглушка."""
+    """Расписание преподавателя на ближайшие 7 дней (группировка по дате)."""
     teacher = await _require_teacher(update, context)
     if not teacher:
         return
     query = update.callback_query
 
-    text = "\U0001f4c5 Расписание на неделю будет доступно позже."
-    keyboard = [
+    today = date.today()
+    end = today + timedelta(days=6)
+    events = EventCache.get_by_teacher_period(teacher["id"], today, end)
+
+    if not events:
+        text = "\U0001f4c5 Расписание на неделю\n\nУ вас нет занятий в ближайшие 7 дней."
+        keyboard = [
+            [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_panel")]
+        ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    lines = ["\U0001f4c5 Расписание на неделю", ""]
+    keyboard = []
+
+    # Группируем события по дате
+    by_date: dict = {}
+    for ev in events:
+        by_date.setdefault(ev.get("start_date"), []).append(ev)
+
+    for day, day_events in sorted(by_date.items()):
+        lines.append(f"— {_format_date(day)} —")
+        for ev in day_events:
+            time_str = _format_time(ev.get("start_time"))
+            name = ev.get("name") or "Занятие"
+            em_id = ev.get("em_event_id")
+            count = Booking.count_confirmed_for_event(em_id) if em_id else 0
+
+            lines.append(f"\U0001f555 {time_str} — {name} ({count} чел.)")
+            if em_id:
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            f"{time_str} — {name}",
+                            callback_data=f"teacher_class_{em_id}",
+                        )
+                    ]
+                )
+        lines.append("")
+
+    keyboard.append(
         [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_panel")]
-    ]
-    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+    )
+    await _safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(keyboard))
 
 
 async def show_teacher_class(
     update: Update, context: ContextTypes.DEFAULT_TYPE, em_event_id: int
 ):
-    """Список записавшихся на занятие с кнопками отметки."""
+    """Список записавшихся на занятие с кнопками отметки (из bookings)."""
     teacher = await _require_teacher(update, context)
     if not teacher:
         return
     query = update.callback_query
 
     bookings = Booking.get_by_event(em_event_id) if em_event_id else []
-    ev = EventCache.get_by_id(em_event_id) if em_event_id else None  # нет, em_event_id != PK
-
-    time_str = ""
-    ev_name = "Занятие"
-    if em_event_id:
-        # Достаём событие из кэша по em_event_id
-        for e in EventCache.get_by_teacher_today(teacher["id"]):
-            if e.get("em_event_id") == em_event_id:
-                time_str = _format_time(e.get("start_time"))
-                ev_name = e.get("name") or "Занятие"
-                break
+    ev = EventCache.get_by_em_event(em_event_id) if em_event_id else None
+    time_str = _format_time(ev.get("start_time")) if ev else ""
+    ev_name = ev.get("name") if ev else "Занятие"
 
     if not bookings:
         text = f"\U0001f465 Группа на {time_str or ev_name}\n\nНет записей."
@@ -185,21 +216,19 @@ async def handle_teacher_mark(
         await safe_answer(query, "У клиента нет активного абонемента", show_alert=True)
         return
 
-    # Списание часов (по умолчанию 1.0, но можно 1.5 если в событии длительность)
+    # Списание часов: длительность из события в events_cache (по умолчанию 1.0)
     hours = 1.0
     if em_event_id:
-        for e in EventCache.get_by_teacher_today(teacher["id"]):
-            if e.get("em_event_id") == em_event_id:
-                if e.get("end_time") and e.get("start_time"):
-                    try:
-                        dur = (
-                            datetime.combine(date.min, e["end_time"])
-                            - datetime.combine(date.min, e["start_time"])
-                        ).total_seconds() / 3600
-                        hours = round(dur, 1)
-                    except Exception:
-                        pass
-                break
+        ev = EventCache.get_by_em_event(em_event_id)
+        if ev and ev.get("end_time") and ev.get("start_time"):
+            try:
+                dur = (
+                    datetime.combine(date.min, ev["end_time"])
+                    - datetime.combine(date.min, ev["start_time"])
+                ).total_seconds() / 3600
+                hours = round(dur, 1)
+            except Exception:
+                pass
 
     if not Subscription.update_hours(sub["id"], -hours):
         await safe_answer(query, "Не удалось списать часы", show_alert=True)

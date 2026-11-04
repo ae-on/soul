@@ -30,7 +30,6 @@ from db.constants import CONSENT_TEXT, CONSENT_TEXT_VERSION
 from db.models import (
     EventCache,
     Freeze,
-    Group,
     Subscription,
     SubscriptionType,
     User,
@@ -63,7 +62,7 @@ from handlers.admin import (
     show_admin_role_revoke,
     show_admin_roles,
     show_admin_slot_assign,
-    show_admin_slot_create_stub,
+    admin_slot_create_start,
     show_admin_slot_manage,
     show_admin_slots,
     show_admin_sub_manage,
@@ -236,15 +235,12 @@ async def get_upcoming_events() -> list[dict]:
 async def sync_events_cache() -> int:
     """
     Синхронизирует events_cache с EM API: получает события, определяет
-    teacher_id (из owner или сопоставления со слотами), upsert в кэш.
+    teacher_id (по email или имени владельца события), upsert в кэш.
     Возвращает количество обработанных событий.
     """
     events = await get_upcoming_events()
     if not events:
         return 0
-
-    # Загружаем все слоты для сопоставления по категории+времени
-    all_slots = Group.get_active()  # type: ignore[attr-defined]
 
     count = 0
     for ev in events:
@@ -264,37 +260,22 @@ async def sync_events_cache() -> int:
         if not start_date:
             continue
 
-        # Пытаемся определить teacher_id
-        teacher_id = None
-
-        # 1. Из owner события (если EM API передаёт владельца)
+        # Владелец события из EM (API может не отдавать email — тогда ищем по имени)
+        owner_email = None
+        owner_name = None
         owner = ev.get("owner") or {}
         if isinstance(owner, dict):
-            owner_name = owner.get("name") or ""
-            if owner_name:
-                # Ищем пользователя по full_name (простейшее сопоставление)
-                user = User.get_by_field(full_name=owner_name)
-                if user:
-                    roles = UserRole.get_active_roles(user[0]["id"])
-                    if "teacher" in roles or "admin" in roles:
-                        teacher_id = user[0]["id"]
+            owner_email = owner.get("email")
+            owner_name = owner.get("name")
         elif isinstance(owner, str) and owner:
-            user = User.get_by_field(full_name=owner)
-            if user:
-                roles = UserRole.get_active_roles(user[0]["id"])
-                if "teacher" in roles or "admin" in roles:
-                    teacher_id = user[0]["id"]
+            owner_name = owner
 
-        # 2. Если не нашли по owner — сопоставляем со слотами
-        if teacher_id is None and start_time and category_slug:
-            # Приводим время из EM (может быть "18:00:00" или "18:00") к формату для сравнения
-            ev_time_str = str(start_time)[:5]
-            for slot in all_slots:
-                slot_time = _format_time(slot.get("time_start"))
-                if slot_time == ev_time_str and slot.get("category_slug") == category_slug:
-                    teacher_id = slot.get("teacher_id")
-                    if teacher_id:
-                        break
+        # Находим преподавателя: сначала по email, затем по имени
+        teacher_id = None
+        if owner_email or owner_name:
+            teacher_id = User.find_teacher_id(owner_email, owner_name)
+        if not teacher_id:
+            logger.info("Не найден преподаватель для события %s (email=%s, name=%s)", em_id, owner_email, owner_name)
 
         # Upsert в кэш
         try:
@@ -2214,7 +2195,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
     if data == "admin_slot_create":
-        await show_admin_slot_create_stub(update, context)
+        await admin_slot_create_start(update, context)
         return
 
     # Заглушка для неинтерактивных кнопок-индикаторов
