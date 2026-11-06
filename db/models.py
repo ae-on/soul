@@ -166,6 +166,29 @@ class User(BaseModel):
                 conn.commit()
                 return cur.rowcount > 0
 
+    # Поля users, которые можно обновлять админкой (белый список для UPDATE)
+    EDITABLE_FIELDS = {"full_name", "phone", "email", "username", "notes"}
+
+    @classmethod
+    def update_field(cls, user_id: int, field: str, value) -> bool:
+        """
+        Обновить одно поле пользователя (по белому списку EDITABLE_FIELDS).
+        Возвращает False для недопустимого поля.
+        """
+        if field not in cls.EDITABLE_FIELDS:
+            return False
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE users SET {field} = %s WHERE id = %s",
+                    (value, user_id),
+                )
+                conn.commit()
+                ok = cur.rowcount > 0
+                if ok:
+                    logger.info("Пользователь %s: поле %s обновлено", user_id, field)
+                return ok
+
     @classmethod
     def set_consent(cls, user_id: int, version: str) -> bool:
         """

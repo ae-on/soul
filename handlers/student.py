@@ -45,7 +45,6 @@ from handlers.admin import (
     admin_sub_visit_handler,
     admin_sub_visit_hours_handler,
     freeze_custom_start,
-    handle_admin_slot_set_teacher,
     handle_admin_sub_add_days,
     handle_admin_sub_reset_freezes,
     handle_admin_sub_reset_manual,
@@ -55,21 +54,26 @@ from handlers.admin import (
     handle_freeze_reject,
     handle_sub_add_hours,
     handle_sub_sub_hours,
-    show_admin_admins,
-    show_admin_clients,
     show_admin_panel,
-    show_admin_role_grant,
-    show_admin_role_revoke,
-    show_admin_roles,
+    show_admin_sub_manage,
+    show_admin_user_subs,
+)
+from handlers.admin_slots import (
+    handle_admin_slot_delete,
+    handle_admin_slots_sync,
+    handle_admin_slot_set_teacher,
     show_admin_slot_assign,
-    admin_slot_create_start,
     show_admin_slot_manage,
     show_admin_slots,
-    show_admin_sub_manage,
-    show_admin_teachers,
-    show_admin_user_card,
-    show_admin_user_roles,
-    show_admin_user_subs,
+)
+from handlers.admin_users import (
+    show_admin_clients, show_admin_teachers, show_admin_admins,
+    show_admin_user_card, show_admin_roles, show_admin_user_roles,
+    show_admin_role_grant, show_admin_role_revoke,
+    show_admin_user_manage, handle_admin_user_block,
+    handle_admin_user_unblock, admin_user_edit_start,
+    admin_user_add_start, admin_user_delete_confirm, admin_user_delete_do,
+    show_admin_user_delete_list,
 )
 from handlers.helpers import (
     FREEZE_MAX_DAYS,
@@ -249,9 +253,11 @@ async def sync_events_cache() -> int:
             continue
 
         name = ev.get("name") or ""
-        start_date = ev.get("event_start_date")
-        start_time = ev.get("event_start_time")
-        end_time = ev.get("event_end_time")
+        # EM API отдаёт даты вложенно в when (плоские ключи — страховка)
+        when = ev.get("when") or {}
+        start_date = when.get("start_date") or ev.get("event_start_date")
+        start_time = when.get("start_time") or ev.get("event_start_time")
+        end_time = when.get("end_time") or ev.get("event_end_time")
         category_slug = ev.get("category_slug") or ""
         location_id = ev.get("location_id")
         location_name = ev.get("location_name") or ""
@@ -294,7 +300,7 @@ async def sync_events_cache() -> int:
         except Exception as e:
             logger.error("Ошибка при сохранении события %s: %s", em_id, e)
 
-    logger.info("Синхронизация кэша событий: %d обработано", count)
+    logger.info("Скачано %d событий, сохранено %d", len(events), count)
     return count
 
 
@@ -2194,9 +2200,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 pass
 
-    if data == "admin_slot_create":
-        await admin_slot_create_start(update, context)
+    if data == "admin_slots_sync":
+        await handle_admin_slots_sync(update, context)
         return
+
+    if data.startswith("admin_slot_delete_"):
+        sid = _extract_int(data, "admin_slot_delete_")
+        if sid is not None:
+            await handle_admin_slot_delete(update, context, sid)
+            return
 
     # Заглушка для неинтерактивных кнопок-индикаторов
     if data == "noop":
@@ -2205,6 +2217,51 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_roles":
         await show_admin_roles(update, context)
         return
+
+    # Управление пользователем (админ-карточка с CRUD)
+    if data.startswith("admin_user_manage_"):
+        uid = _extract_int(data, "admin_user_manage_")
+        if uid is not None:
+            await show_admin_user_manage(update, context, uid)
+            return
+
+    if data.startswith("admin_user_block_"):
+        uid = _extract_int(data, "admin_user_block_")
+        if uid is not None:
+            await handle_admin_user_block(update, context, uid)
+            return
+
+    if data.startswith("admin_user_unblock_"):
+        uid = _extract_int(data, "admin_user_unblock_")
+        if uid is not None:
+            await handle_admin_user_unblock(update, context, uid)
+            return
+
+    if data.startswith("admin_user_edit_"):
+        await admin_user_edit_start(update, context)
+        return
+
+    # Добавление пользователя (вход диалога — обычно перехватывает ConversationHandler)
+    if data == "admin_user_add":
+        await admin_user_add_start(update, context)
+        return
+
+    # Удаление заблокированных
+    if data == "admin_user_delete_list":
+        await show_admin_user_delete_list(update, context)
+        return
+
+    if data.startswith("admin_user_delete_confirm_"):
+        uid = _extract_int(data, "admin_user_delete_confirm_")
+        if uid is not None:
+            await admin_user_delete_confirm(update, context, uid)
+            return
+
+    if data.startswith("admin_user_delete_do_"):
+        uid = _extract_int(data, "admin_user_delete_do_")
+        if uid is not None:
+            await admin_user_delete_do(update, context, uid)
+            return
 
     # Управление ролями пользователя — проверяем ДО admin_user_
     if data.startswith("admin_user_roles_"):

@@ -8,7 +8,7 @@
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS users (
     id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    telegram_id     BIGINT UNSIGNED NOT NULL,
+    telegram_id     BIGINT UNSIGNED DEFAULT NULL COMMENT 'Telegram ID (может отсутствовать)',
     username        VARCHAR(255) DEFAULT NULL COMMENT 'Telegram @username',
     full_name       VARCHAR(255) NOT NULL DEFAULT '',
     phone           VARCHAR(50) NOT NULL DEFAULT '',
