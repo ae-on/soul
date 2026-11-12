@@ -234,15 +234,26 @@ def main():
     )
     application.add_handler(CallbackQueryHandler(button_handler))
 
+    # ВАЖНО ДЛЯ ДЕПЛОЯ: Перед запуском на VPS убедитесь, что выполнены все миграции!
+    # Команда: python3 db/migrations/run_migration.py 001_add_user_roles.sql
+    # (и так далее по порядку — 002, 003... последняя)
+
+    # Безопасная инициализация цикла событий (Python 3.12+)
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    # Синхронизация кэша событий при старте
+    try:
+        loop.run_until_complete(sync_events_cache())
+    except Exception as e:
+        logger.warning("Не удалось синхронизировать кэш событий: %s", e)
+
     # Запуск в режиме polling
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    # Синхронизируем кэш событий при старте
-    try:
-        asyncio.run(sync_events_cache())
-    except Exception as e:
-        logger.warning("Не удалось синхронизировать кэш событий: %s", e)
-
     main()
