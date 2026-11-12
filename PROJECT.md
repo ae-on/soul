@@ -35,9 +35,35 @@
 - registration_date — DATETIME DEFAULT CURRENT_TIMESTAMP
 - consent_given — BOOLEAN DEFAULT 0
 
-## Модуль регистрации
-- Бот принимает `/start` с параметром utm_source.
-- Сохраняет пользователя в таблицу clients (telegram_id, utm_source).
-- Показывает главное меню.
-- При нажатии «Записаться» запускается диалог (имя → телефон → сохранение в БД с шифрованием).
-- Планируется: подтверждение записи, выбор даты/времени.
+## Как деплоить на VPS
+
+1. **Обновить код:**
+   ```bash
+   git pull origin main
+   ```
+
+2. **Обновить зависимости:**
+   ```bash
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+3. **Применить новые миграции БД:**
+   ```bash
+   python3 db/migrations/run_migration.py
+   ```
+   Скрипт сам найдёт все неприменённые файлы `.sql` в `db/migrations/` и выполнит их по порядку.
+   Если нужно применить одну конкретную миграцию:
+   ```bash
+   python3 db/migrations/run_migration.py 009_add_teacher_id.sql
+   ```
+
+4. **Перезапустить бота:**
+   ```bash
+   sudo systemctl restart soul-bot
+   ```
+
+---
+
+> **Примечание:** Если бот не запускается с ошибкой `RuntimeError: There is no current event loop` —
+> убедитесь, что используется Python 3.12+ и обновлённый `bot.py` (с безопасной инициализацией цикла событий).
