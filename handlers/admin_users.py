@@ -208,7 +208,8 @@ async def show_admin_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Объединяем admin и super_admin, дедуплицируем по id
     admins = User.get_by_role("admin", limit=100, offset=0, status_filter="all")
     super_admins = User.get_by_role("super_admin", limit=100, offset=0, status_filter="all")
-    merged = {u["id"]: u for u in admins + super_admins}
+    # Приводим к списку — PyMySQL возвращает кортежи
+    merged = {u["id"]: u for u in list(admins) + list(super_admins)}
     users = sorted(merged.values(), key=lambda u: (u.get("full_name") or "").lower())
 
     if not users:
