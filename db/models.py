@@ -262,6 +262,95 @@ class User(BaseModel):
                 return cur.fetchall()
 
     @classmethod
+    def get_students_for_admin(
+        cls, filter_type: str = "all", limit: int = 10, offset: int = 0
+    ) -> list[dict]:
+        """
+        Клиенты (роль student) для админки с фильтрами.
+        Подтягивает hours_left активного абонемента.
+        filter_type: 'all' | 'active' | 'inactive' | 'new' | '30_days'.
+        Сортировка по full_name ASC.
+        """
+        base_join = (
+            "JOIN user_roles ur ON ur.user_id = u.id"
+            " AND ur.role = 'student' AND ur.active = 1"
+        )
+        extra_where = ""
+        if filter_type == "active":
+            extra_where = (
+                "AND EXISTS (SELECT 1 FROM subscriptions s"
+                " WHERE s.user_id = u.id"
+                " AND s.status = 'active'"
+                " AND s.expires_at >= NOW())"
+            )
+        elif filter_type == "inactive":
+            extra_where = (
+                "AND NOT EXISTS (SELECT 1 FROM subscriptions s"
+                " WHERE s.user_id = u.id"
+                " AND s.status = 'active'"
+                " AND s.expires_at >= NOW())"
+            )
+        elif filter_type == "new":
+            extra_where = "AND u.status = 'new'"
+        elif filter_type == "30_days":
+            extra_where = "AND u.registered_at >= NOW() - INTERVAL 30 DAY"
+
+        sql = f"""
+            SELECT u.id, u.full_name, u.username, u.telegram_id, u.status,
+                   (SELECT s.hours_left FROM subscriptions s
+                    WHERE s.user_id = u.id AND s.status = 'active'
+                    ORDER BY s.created_at DESC LIMIT 1) AS hours_left
+            FROM users u
+            {base_join}
+            WHERE 1=1 {extra_where}
+            ORDER BY u.full_name ASC
+            LIMIT %s OFFSET %s
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(sql, (limit, offset))
+                return cur.fetchall()
+
+    @classmethod
+    def count_students_for_admin(cls, filter_type: str = "all") -> int:
+        """Количество клиентов (роль student) с фильтром."""
+        base_join = (
+            "JOIN user_roles ur ON ur.user_id = u.id"
+            " AND ur.role = 'student' AND ur.active = 1"
+        )
+        extra_where = ""
+        if filter_type == "active":
+            extra_where = (
+                "AND EXISTS (SELECT 1 FROM subscriptions s"
+                " WHERE s.user_id = u.id"
+                " AND s.status = 'active'"
+                " AND s.expires_at >= NOW())"
+            )
+        elif filter_type == "inactive":
+            extra_where = (
+                "AND NOT EXISTS (SELECT 1 FROM subscriptions s"
+                " WHERE s.user_id = u.id"
+                " AND s.status = 'active'"
+                " AND s.expires_at >= NOW())"
+            )
+        elif filter_type == "new":
+            extra_where = "AND u.status = 'new'"
+        elif filter_type == "30_days":
+            extra_where = "AND u.registered_at >= NOW() - INTERVAL 30 DAY"
+
+        sql = f"""
+            SELECT COUNT(*) AS cnt
+            FROM users u
+            {base_join}
+            WHERE 1=1 {extra_where}
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(sql)
+                row = cur.fetchone()
+                return row["cnt"] if row else 0
+
+    @classmethod
     def count_by_status(cls) -> dict:
         """
         Возвращает словарь с количеством пользователей по статусам.
@@ -440,33 +529,6 @@ class User(BaseModel):
 
         items.sort(key=_sort_key, reverse=True)
         return items[:limit]
-
-    @classmethod
-    def get_clients_for_admin(
-        cls, limit: int = 10, offset: int = 0, status_filter: str = "all"
-    ) -> list[dict]:
-        """
-        Клиенты (роль student) для админки.
-        Подтягивает hours_left активного абонемента (скалярный подзапрос),
-        чтобы на кнопках показывать остаток часов.
-        status_filter: 'all' | 'new' | 'active'. Сортировка по full_name ASC.
-        """
-        with get_connection() as conn:
-            with conn.cursor(DictCursor) as cur:
-                cur.execute(
-                    """SELECT u.id, u.full_name, u.username, u.status, u.telegram_id,
-                              (SELECT s.hours_left FROM subscriptions s
-                               WHERE s.user_id = u.id AND s.status = 'active'
-                               ORDER BY s.created_at DESC LIMIT 1) AS hours_left
-                       FROM users u
-                       JOIN user_roles ur ON ur.user_id = u.id
-                         AND ur.role = 'student' AND ur.active = 1
-                       WHERE %s = 'all' OR u.status = %s
-                       ORDER BY u.full_name ASC
-                       LIMIT %s OFFSET %s""",
-                    (status_filter, status_filter, limit, offset),
-                )
-                return cur.fetchall()
 
 
 class SubscriptionType(BaseModel):

@@ -73,7 +73,7 @@ from handlers.admin_users import (
     show_admin_user_manage, handle_admin_user_block,
     handle_admin_user_unblock, admin_user_edit_start,
     admin_user_add_start, admin_user_delete_confirm, admin_user_delete_do,
-    show_admin_user_delete_list,
+    show_admin_user_delete_list, handle_admin_user_swap_name,
 )
 from handlers.helpers import (
     FREEZE_MAX_DAYS,
@@ -2149,7 +2149,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if page < 1:
             # Некорректный номер страницы — сбрасываем на первую
             page = 1
-        status_filter = parts[1] if len(parts) == 2 and parts[1] in ("new", "active", "all") else "all"
+        status_filter = parts[1] if len(parts) == 2 and parts[1] in ("new", "active", "all", "inactive", "30_days") else "all"
         await show_admin_clients(update, context, page=page, status_filter=status_filter)
         return
 
@@ -2263,6 +2263,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await admin_user_delete_do(update, context, uid)
             return
 
+    if data.startswith("admin_user_swap_name_"):
+        uid = _extract_int(data, "admin_user_swap_name_")
+        if uid is not None:
+            await handle_admin_user_swap_name(update, context, uid)
+            return
+
+    # Карточка пользователя
     # Управление ролями пользователя — проверяем ДО admin_user_
     if data.startswith("admin_user_roles_"):
         try:

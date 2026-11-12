@@ -20,13 +20,14 @@ from telegram.ext import (
 
 from db.connection import get_connection
 from db.constants import CONSENT_TEXT_VERSION
-from db.models import User, UserRole
+from db.models import Subscription, User, UserRole
 from handlers.helpers import (
     CLIENTS_PER_PAGE,
     _client_button_label,
     _format_user_line,
     _require_admin,
     _safe_edit,
+    _short_name,
     safe_answer,
 )
 
@@ -60,33 +61,49 @@ async def show_admin_clients(
         return
     query = update.callback_query
 
-    total = User.count_by_role("student", status_filter=status_filter)
-    total_pages = max(1, math.ceil(total / CLIENTS_PER_PAGE))
+    # Человекочитаемые подписи фильтров
+    filter_labels = {
+        "all": "📦 Все",
+        "active": "✅ Активные",
+        "inactive": "⏳ Неактивные",
+        "new": "🆕 Новые",
+        "30_days": "📅 За 30 дней",
+    }
+    current_label = filter_labels.get(status_filter, status_filter)
 
-    # Защита от выхода за границы пагинации
-    if page < 1:
-        page = 1
-    if page > total_pages:
-        page = total_pages
-
-    offset = (page - 1) * CLIENTS_PER_PAGE
-    # Клиенты с остатком часов активного абонемента (для кнопок)
-    users = User.get_clients_for_admin(
-        limit=CLIENTS_PER_PAGE, offset=offset, status_filter=status_filter
-    )
-
-    # Фильтры по статусу (всегда сбрасывают на первую страницу)
-    filter_row = [
-        InlineKeyboardButton("\U0001f195 Новые", callback_data="admin_clients_page_1_new"),
-        InlineKeyboardButton("\u2705 Активные", callback_data="admin_clients_page_1_active"),
-        InlineKeyboardButton("\U0001f4e6 Все", callback_data="admin_clients_page_1_all"),
+    # Фильтры по статусу (2 ряда, сброс на 1-ю страницу)
+    filter_keyboard = [
+        [
+            InlineKeyboardButton("\u2705 Активные", callback_data="admin_clients_page_1_active"),
+            InlineKeyboardButton("\u23f3 Неактивные", callback_data="admin_clients_page_1_inactive"),
+            InlineKeyboardButton("\U0001f4e6 Все", callback_data="admin_clients_page_1_all"),
+        ],
+        [
+            InlineKeyboardButton("\U0001f195 Новые", callback_data="admin_clients_page_1_new"),
+            InlineKeyboardButton("\U0001f4c5 За 30 дней", callback_data="admin_clients_page_1_30_days"),
+        ],
     ]
 
-    if total == 0:
-        # Пустой список: фильтры остаются, пагинация скрыта
-        text = "\U0001f465 Клиенты (Всего: 0)\n\nНичего не найдено."
+    # Пагинация
+    page = max(1, page)
+    total = User.count_students_for_admin(filter_type=status_filter)
+    total_pages = max(1, math.ceil(total / CLIENTS_PER_PAGE))
+    if page > total_pages:
+        page = total_pages
+    offset = (page - 1) * CLIENTS_PER_PAGE
+
+    # Запрос клиентов
+    users = User.get_students_for_admin(
+        filter_type=status_filter, limit=CLIENTS_PER_PAGE, offset=offset
+    )
+
+    logger.info("Фильтр: %s, найдено: %d", status_filter, len(users))
+
+    # Пустой список
+    if not users:
+        text = f"\U0001f465 Клиенты ({current_label}). Всего: {total}\n\nНичего не найдено."
         keyboard = [
-            filter_row,
+            *filter_keyboard,
             [InlineKeyboardButton("\u2795 Добавить пользователя", callback_data="admin_user_add")],
             [
                 InlineKeyboardButton(
@@ -96,13 +113,17 @@ async def show_admin_clients(
             ],
             [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")],
         ]
+        logger.info(
+            "show_admin_clients: filter=%s, page=%s, total=%s, clients=%s (empty)",
+            status_filter, page, total, len(users),
+        )
         await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
         return
 
-    text = f"\U0001f465 Клиенты (Всего: {total})\nВыберите клиента для управления:"
+    text = f"\U0001f465 Клиенты ({current_label}). Всего: {total}"
 
-    keyboard = [filter_row]
-    # Клики по кнопкам клиентов — карточка пользователя
+    keyboard = [*filter_keyboard]
+    # Клиенты
     for u in users:
         keyboard.append(
             [
@@ -113,49 +134,29 @@ async def show_admin_clients(
             ]
         )
 
-    # Навигация: стрелки только если есть куда листать
+    # Навигация
     if total_pages > 1:
         nav = []
         if page > 1:
-            nav.append(
-                InlineKeyboardButton(
-                    "\u2b05\ufe0f",
-                    callback_data=f"admin_clients_page_{page - 1}_{status_filter}",
-                )
-            )
+            nav.append(InlineKeyboardButton("\u2b05\ufe0f", callback_data=f"admin_clients_page_{page - 1}_{status_filter}"))
         nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
         if page < total_pages:
-            nav.append(
-                InlineKeyboardButton(
-                    "\u27a1\ufe0f",
-                    callback_data=f"admin_clients_page_{page + 1}_{status_filter}",
-                )
-            )
+            nav.append(InlineKeyboardButton("\u27a1\ufe0f", callback_data=f"admin_clients_page_{page + 1}_{status_filter}"))
         keyboard.append(nav)
 
-        # Номера страниц [1] [2] [3] ... (активная страница — в скобках)
         page_buttons = []
         for p in range(1, total_pages + 1):
             label = f"[{p}]" if p == page else str(p)
-            page_buttons.append(
-                InlineKeyboardButton(label, callback_data=f"admin_clients_page_{p}_{status_filter}")
-            )
+            page_buttons.append(InlineKeyboardButton(label, callback_data=f"admin_clients_page_{p}_{status_filter}"))
         for i in range(0, len(page_buttons), 5):
             keyboard.append(page_buttons[i : i + 5])
 
-    keyboard.append(
-        [InlineKeyboardButton("\u2795 Добавить пользователя", callback_data="admin_user_add")]
-    )
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                "\U0001f5d1\ufe0f Удалить заблокированных",
-                callback_data="admin_user_delete_list",
-            )
-        ]
-    )
-    keyboard.append(
-        [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")]
+    keyboard.append([InlineKeyboardButton("\u2795 Добавить пользователя", callback_data="admin_user_add")])
+    keyboard.append([InlineKeyboardButton("\U0001f5d1\ufe0f Удалить заблокированных", callback_data="admin_user_delete_list")])
+    keyboard.append([InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")])
+    logger.info(
+        "show_admin_clients: filter=%s, page=%s, total=%s, clients=%s",
+        status_filter, page, total, len(users),
     )
     await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
@@ -185,7 +186,9 @@ async def show_admin_teachers(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     keyboard = []
     for u in users:
-        name = u.get("full_name") or u.get("username") or f"ID {u.get('telegram_id')}"
+        name = _short_name(
+            u.get("full_name") or u.get("username") or f"ID {u.get('telegram_id')}"
+        )
         keyboard.append(
             [InlineKeyboardButton(f"\U0001f464 {name}", callback_data=f"admin_user_manage_{u['id']}")]
         )
@@ -223,7 +226,7 @@ async def show_admin_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = []
     for u in users:
-        name = u.get("full_name") or u.get("username") or f"ID {u.get('telegram_id')}"
+        name = _short_name(u.get("full_name") or u.get("username") or f"ID {u.get('telegram_id')}")
         keyboard.append(
             [InlineKeyboardButton(f"\U0001f464 {name}", callback_data=f"admin_user_manage_{u['id']}")]
         )
@@ -233,9 +236,6 @@ async def show_admin_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
 
-# ----------------------------------------------------------------------
-# Карточка пользователя
-# ----------------------------------------------------------------------
 async def show_admin_user_card(
     update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
 ):
@@ -349,7 +349,11 @@ async def show_admin_user_manage(
         [
             InlineKeyboardButton(
                 "\u270f\ufe0f Имя", callback_data=f"admin_user_edit_{user_id}_name"
-            )
+            ),
+            InlineKeyboardButton(
+                "\U0001f504 Поменять Имя/Фамилию",
+                callback_data=f"admin_user_swap_name_{user_id}",
+            ),
         ],
         [
             InlineKeyboardButton(
@@ -501,6 +505,45 @@ async def admin_user_edit_cancel(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # ----------------------------------------------------------------------
+# Смена порядка имени/фамилии
+# ----------------------------------------------------------------------
+async def handle_admin_user_swap_name(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """Поменять Имя и Фамилию местами."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    u = User.get_by_id(user_id)
+    if not u:
+        await safe_answer(query, "Пользователь не найден", show_alert=True)
+        return
+
+    name = (u.get("full_name") or "").strip()
+    parts = name.split()
+    if len(parts) != 2:
+        await safe_answer(
+            query,
+            "Имя должно состоять ровно из двух слов (Имя Фамилия или Фамилия Имя).",
+            show_alert=True,
+        )
+        return
+
+    new_name = f"{parts[1]} {parts[0]}"
+    User.update_field(user_id, "full_name", new_name)
+    logger.info(
+        "Админ %s поменял имя пользователя %s: %s -> %s",
+        admin["id"], user_id, name, new_name,
+    )
+    await safe_answer(
+        query, "\u2705 Имя и фамилия поменяны местами.", show_alert=True
+    )
+    await show_admin_user_manage(update, context, user_id)
+
+
+# ----------------------------------------------------------------------
 # Блокировка / разблокировка пользователя
 # ----------------------------------------------------------------------
 async def handle_admin_user_block(
@@ -515,6 +558,15 @@ async def handle_admin_user_block(
     u = User.get_by_id(user_id)
     if not u:
         await safe_answer(query, "Пользователь не найден", show_alert=True)
+        return
+
+    # Нельзя заблокировать пользователя с активным абонементом
+    if Subscription.get_active_for_user(user_id):
+        await safe_answer(
+            query,
+            "Нельзя заблокировать: у клиента есть активный абонемент.",
+            show_alert=True,
+        )
         return
 
     User.set_status(user_id, "inactive")
@@ -615,22 +667,24 @@ async def show_admin_user_roles(
     )
 
     keyboard = []
-    # Кнопки назначения ролей (кроме student — выдаётся автоматически)
-    for role in ["teacher", "admin"]:
+    # Кнопки назначения/снятия ролей (student, teacher, admin)
+    for role in ["student", "teacher", "admin"]:
         if role not in active_roles:
+            label = "Студент" if role == "student" else role
             keyboard.append(
                 [
                     InlineKeyboardButton(
-                        f"\u2795 {role}",
+                        f"\u2795 Добавить {label}",
                         callback_data=f"admin_role_grant_{role}_{user_id}",
                     )
                 ]
             )
         else:
+            label = "Студента" if role == "student" else role
             keyboard.append(
                 [
                     InlineKeyboardButton(
-                        f"\u274c Снять {role}",
+                        f"\u274c Снять {label}",
                         callback_data=f"admin_role_revoke_{role}_{user_id}",
                     )
                 ]
@@ -665,6 +719,16 @@ async def show_admin_role_revoke(
     """Снять роль у пользователя."""
     admin = await _require_admin(update, context)
     if not admin:
+        return
+
+    # Нельзя снять роль, если у пользователя активный абонемент
+    if Subscription.get_active_for_user(user_id):
+        query = update.callback_query
+        await safe_answer(
+            query,
+            "Нельзя снять роль: у клиента есть активный абонемент.",
+            show_alert=True,
+        )
         return
 
     UserRole.revoke(user_id, role)
