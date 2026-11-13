@@ -75,6 +75,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("\U0001f4c5 Слоты и группы", callback_data="admin_slots")],
         [InlineKeyboardButton("\U0001f9d1\u200d\U0001f3eb Учителя", callback_data="admin_teachers")],
         [InlineKeyboardButton("\U0001f527 Админы", callback_data="admin_admins")],
+        [InlineKeyboardButton("\U0001f3ab Тарифы", callback_data="admin_types")],
         [InlineKeyboardButton("\U0001f519 Главное меню", callback_data="back_to_main")],
     ]
     text = "\U0001f527 Панель администратора"

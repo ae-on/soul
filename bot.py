@@ -87,6 +87,14 @@ from handlers.admin_users import (
     admin_user_edit_start,
     admin_user_edit_value,
 )
+from handlers.admin_types import (
+    ADD_DAYS, ADD_HOURS, ADD_NAME, ADD_PRICE,
+    EDIT_HOURS, EDIT_PRICE,
+    admin_type_add_cancel, admin_type_add_days, admin_type_add_hours,
+    admin_type_add_name, admin_type_add_price, admin_type_add_start,
+    admin_type_edit_cancel, admin_type_edit_hours_start, admin_type_edit_hours_value,
+    admin_type_edit_price_start, admin_type_edit_price_value,
+)
 from handlers.helpers import check_and_complete_freeze
 
 
@@ -207,6 +215,46 @@ def main():
         fallbacks=[CommandHandler("cancel", admin_user_add_cancel)],
     )
 
+    # ConversationHandler изменения цены тарифа
+    admin_type_edit_price_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_type_edit_price_start, pattern=r"^admin_type_edit_price_\d+$")
+        ],
+        states={
+            EDIT_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_type_edit_price_value),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin_type_edit_cancel)],
+    )
+
+    # ConversationHandler изменения часов тарифа
+    admin_type_edit_hours_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_type_edit_hours_start, pattern=r"^admin_type_edit_hours_\d+$")
+        ],
+        states={
+            EDIT_HOURS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_type_edit_hours_value),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin_type_edit_cancel)],
+    )
+
+    # ConversationHandler добавления нового тарифа
+    admin_type_add_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_type_add_start, pattern=r"^admin_type_add$")
+        ],
+        states={
+            ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_type_add_name)],
+            ADD_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_type_add_hours)],
+            ADD_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_type_add_days)],
+            ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_type_add_price)],
+        },
+        fallbacks=[CommandHandler("cancel", admin_type_add_cancel)],
+    )
+
     # -----------------------------------------------------------------------
     # Error handler
     # -----------------------------------------------------------------------
@@ -229,6 +277,9 @@ def main():
     application.add_handler(admin_profile_conv)
     application.add_handler(admin_user_edit_conv)
     application.add_handler(admin_user_add_conv)
+    application.add_handler(admin_type_edit_price_conv)
+    application.add_handler(admin_type_edit_hours_conv)
+    application.add_handler(admin_type_add_conv)
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
     )

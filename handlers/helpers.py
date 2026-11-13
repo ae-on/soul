@@ -8,7 +8,7 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
@@ -66,14 +66,39 @@ async def safe_answer(query, text=None, show_alert=False):
         logger.warning("Не удалось ответить на callback (%s): %s", type(e).__name__, e)
 
 
-async def _safe_edit(query, text: str, reply_markup=None):
-    """Редактирует сообщение, игнорируя «Message is not modified»."""
-    try:
-        await query.edit_message_text(text, reply_markup=reply_markup)
-    except BadRequest as e:
-        if "Message is not modified" in str(e):
-            return
-        raise
+async def _safe_edit(
+    update: Update | CallbackQuery | None,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+):
+    """
+    Редактирует сообщение. Принимает Update (новый формат: _safe_edit(update, ...))
+    или CallbackQuery (старый формат: _safe_edit(query, ...)).
+    Игнорирует «Message is not modified».
+    """
+    if isinstance(update, Update):
+        query = update.callback_query
+        if query:
+            try:
+                await query.edit_message_text(text, reply_markup=reply_markup)
+            except BadRequest as e:
+                if "Message is not modified" in str(e):
+                    pass
+                else:
+                    raise
+        elif update.message:
+            await update.message.reply_text(text, reply_markup=reply_markup)
+        elif update.effective_chat:
+            await update.effective_chat.send_message(text, reply_markup=reply_markup)
+    elif isinstance(update, CallbackQuery):
+        # Старый формат вызова: _safe_edit(query, ...) — CallbackQuery передаётся напрямую
+        try:
+            await update.edit_message_text(text, reply_markup=reply_markup)
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                pass
+            else:
+                raise
 
 
 async def notify_admin(

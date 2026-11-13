@@ -66,6 +66,14 @@ from handlers.admin_slots import (
     show_admin_slot_manage,
     show_admin_slots,
 )
+from handlers.admin_types import (
+    admin_type_add_start,
+    admin_type_edit_hours_start,
+    admin_type_edit_price_start,
+    handle_admin_type_toggle,
+    show_admin_type_manage,
+    show_admin_types,
+)
 from handlers.admin_users import (
     show_admin_clients, show_admin_teachers, show_admin_admins,
     show_admin_user_card, show_admin_roles, show_admin_user_roles,
@@ -2202,6 +2210,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admin_slots_sync":
         await handle_admin_slots_sync(update, context)
+        return
+
+    if data == "admin_types":
+        await show_admin_types(update, context)
+        return
+
+    if data.startswith("admin_type_manage_"):
+        tid = _extract_int(data, "admin_type_manage_")
+        if tid is not None:
+            await show_admin_type_manage(update, context, tid)
+            return
+
+    if data.startswith("admin_type_toggle_"):
+        tid = _extract_int(data, "admin_type_toggle_")
+        if tid is not None:
+            await handle_admin_type_toggle(update, context, tid)
+            return
+
+    if data.startswith("admin_type_edit_price_"):
+        await admin_type_edit_price_start(update, context)
+        return
+
+    if data.startswith("admin_type_edit_hours_"):
+        await admin_type_edit_hours_start(update, context)
+        return
+
+    if data == "admin_type_add":
+        await admin_type_add_start(update, context)
         return
 
     if data.startswith("admin_slot_delete_"):
