@@ -134,6 +134,39 @@ def _format_date(value) -> str:
     return str(value)[:10]
 
 
+def format_client_card_info(user_id: int) -> str:
+    """
+    Строка с информацией об активном абонементе клиента для карточки.
+    Пример:
+      🎫 Абонемент: 8 часов (Осталось: 6.5ч, Действует до: 25.12.2026)
+      🧊 Заморозка: активна с 01.12.2026 по 07.12.2026
+    Если абонемента нет: «🎫 Абонемент: Нет активного.»
+    """
+    sub = Subscription.get_active_for_user(user_id)
+    if not sub:
+        return "\U0001f3ab Абонемент: Нет активного."
+
+    sub_type = (
+        SubscriptionType.get_by_id(sub["type_id"]) if sub.get("type_id") else None
+    )
+    type_name = sub_type["name"] if sub_type else "Абонемент"
+    hours_left = sub.get("hours_left")
+    hours_str = f"{hours_left}ч" if hours_left is not None else "безлимит"
+    expires_str = _format_date(sub.get("expires_at"))
+    lines = [
+        f"\U0001f3ab Абонемент: {type_name} "
+        f"(Осталось: {hours_str}, Действует до: {expires_str})"
+    ]
+
+    freeze = Freeze.get_active_for_subscription(sub["id"])
+    if freeze:
+        lines.append(
+            f"\U0001f9ca Заморозка: активна с {_format_date(freeze['start_date'])} "
+            f"по {_format_date(freeze['end_date'])}"
+        )
+    return "\n".join(lines)
+
+
 def _format_time(value) -> str:
     """Форматирует время как ЧЧ:ММ (из timedelta/time/строки); None — «—»."""
     if value is None:

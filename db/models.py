@@ -518,6 +518,20 @@ class User(BaseModel):
                     row["type"] = "audit"
                     items.append(row)
 
+                # Платежи (оплаченные)
+                cur.execute(
+                    """SELECT p.created_at AS date, p.amount, p.method,
+                              st.name AS type_name
+                       FROM payments p
+                       LEFT JOIN subscription_types st ON st.id = p.subscription_type_id
+                       WHERE p.user_id = %s
+                         AND p.status = 'paid'""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "payment"
+                    items.append(row)
+
         # Сортировка по дате DESC (datetime и date приводим к одному типу)
         def _sort_key(x: dict):
             value = x.get("date")
@@ -1225,6 +1239,25 @@ class Booking(BaseModel):
                 )
                 row = cur.fetchone()
                 return row["cnt"] if row else 0
+
+    @classmethod
+    def cancel_future_for_user(cls, user_id: int) -> int:
+        """
+        Отменить все будущие записи пользователя (registered/pending/confirmed,
+        event_date >= CURDATE()). Возвращает количество отменённых записей.
+        """
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE bookings
+                       SET status = 'cancelled', cancelled_at = NOW()
+                       WHERE user_id = %s
+                         AND status IN ('registered', 'pending', 'confirmed')
+                         AND (event_date IS NULL OR event_date >= CURDATE())""",
+                    (user_id,),
+                )
+                conn.commit()
+                return cur.rowcount
 
 
 class Visit(BaseModel):

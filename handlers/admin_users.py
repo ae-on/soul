@@ -1,13 +1,15 @@
 """
 Хендлеры управления пользователями: списки, карточка, CRUD, роли.
 """
+import json
 import logging
 import math
 import re
 from typing import Optional
 
-from datetime import datetime
+from datetime import date, datetime
 
+from pymysql.cursors import DictCursor
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     CallbackQueryHandler,
@@ -24,12 +26,16 @@ from db.models import Subscription, User, UserRole
 from handlers.helpers import (
     CLIENTS_PER_PAGE,
     _client_button_label,
+    _format_date,
     _format_user_line,
+    _plural_days,
     _require_admin,
     _safe_edit,
     _short_name,
+    format_client_card_info,
     safe_answer,
 )
+from services.sales import PAYMENT_METHOD_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +271,9 @@ async def show_admin_user_card(
     else:
         reg_date = "—"
 
+    # Информация об активном абонементе
+    sub_line = format_client_card_info(user_id)
+
     text = (
         f"\U0001f464 {u['full_name'] or '—'}\n"
         f"ID в БД: {u['id']}\n"
@@ -275,8 +284,11 @@ async def show_admin_user_card(
         f"Статус: {u['status']}\n"
         f"Роли: {roles_str}\n"
         f"Согласие на ПДн: {consent}\n"
-        f"Зарегистрирован: {reg_date}"
+        f"Зарегистрирован: {reg_date}\n"
+        f"{sub_line}"
     )
+
+    viewer_roles = UserRole.get_active_roles(admin["id"])
 
     keyboard = [
         [
@@ -289,13 +301,34 @@ async def show_admin_user_card(
         ],
         [
             InlineKeyboardButton(
+                "\U0001f6d2 Продать абонемент", callback_data=f"admin_sell_{user_id}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f4c5 История операций",
+                callback_data=f"admin_user_history_{user_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
                 "\U0001f4e7 Email", callback_data=f"admin_user_edit_{user_id}_email"
             ),
         ],
     ]
 
+    # История абонемента — только для admin/super_admin (для teacher скрыта)
+    if "admin" in viewer_roles or "super_admin" in viewer_roles:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f4dc История абонемента",
+                    callback_data=f"admin_sub_history_{user_id}",
+                )
+            ]
+        )
+
     # Редактирование профиля доступно только супер-админам
-    viewer_roles = UserRole.get_active_roles(admin["id"])
     if "super_admin" in viewer_roles:
         keyboard.append(
             [
@@ -311,10 +344,316 @@ async def show_admin_user_card(
     )
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+    await _safe_edit(update, text, reply_markup)
+
+
+async def show_admin_user_history(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """История операций по клиенту: платежи, посещения, заморозки, действия админа."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+
+    u = User.get_by_id(user_id)
+    if not u:
+        await safe_answer(
+            update.callback_query, "Пользователь не найден", show_alert=True
+        )
+        return
+
+    items = []
+    try:
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                # Платежи (покупки)
+                cur.execute(
+                    """SELECT p.created_at AS date, p.amount, p.method,
+                              st.name AS type_name
+                       FROM payments p
+                       LEFT JOIN subscription_types st ON st.id = p.subscription_type_id
+                       WHERE p.user_id = %s AND p.status = 'paid'""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "payment"
+                    items.append(row)
+
+                # Посещения
+                cur.execute(
+                    """SELECT v.marked_at AS date, v.hours_charged AS hours,
+                              e.name AS event_name
+                       FROM visits v
+                       LEFT JOIN events_cache e ON e.em_event_id = v.em_event_id
+                       WHERE v.user_id = %s""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "visit"
+                    items.append(row)
+
+                # Заморозки
+                cur.execute(
+                    """SELECT f.start_date AS date, f.days, f.status
+                       FROM freezes f
+                       JOIN subscriptions s ON s.id = f.subscription_id
+                       WHERE s.user_id = %s""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "freeze"
+                    items.append(row)
+
+                # Действия администратора (audit_log по абонементам клиента)
+                cur.execute(
+                    """SELECT a.created_at AS date, a.action, a.new_value
+                       FROM audit_log a
+                       JOIN subscriptions s ON s.id = a.record_id
+                       WHERE s.user_id = %s AND a.table_name = 'subscriptions'""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "audit"
+                    items.append(row)
+    except Exception as e:
+        logger.error(
+            "Ошибка при загрузке истории клиента %s: %s", user_id, e, exc_info=True
+        )
+        await safe_answer(
+            update.callback_query, "Не удалось загрузить историю", show_alert=True
+        )
+        return
+
+    # Сортировка по дате DESC (datetime и date приводим к одному типу)
+    def _sort_key(x: dict):
+        value = x.get("date")
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+        return datetime.min
+
+    items.sort(key=_sort_key, reverse=True)
+    items = items[:20]
+
+    if not items:
+        text = "\U0001f4c5 История операций\n\nПока нет записей."
     else:
-        await update.message.reply_text(text, reply_markup=reply_markup)
+        lines = [
+            f"\U0001f4c5 История операций: {u['full_name'] or u['username'] or user_id}",
+            "",
+        ]
+        for item in items:
+            date_str = _format_date(item.get("date"))
+            item_type = item.get("type")
+            if item_type == "payment":
+                amount = item.get("amount")
+                method = PAYMENT_METHOD_LABELS.get(
+                    item.get("method"), item.get("method") or "—"
+                )
+                type_name = item.get("type_name") or "Абонемент"
+                amount_str = f"{amount} BYN" if amount is not None else "—"
+                lines.append(
+                    f"\U0001f4e6 {date_str} · Куплен абонемент '{type_name}' "
+                    f"({amount_str}, {method})"
+                )
+            elif item_type == "visit":
+                hours = item.get("hours")
+                hours_str = f"{hours}ч" if hours is not None else "—"
+                event_name = item.get("event_name") or "Занятие"
+                lines.append(
+                    f"\u2705 {date_str} · Посещение: {event_name} (списано {hours_str})"
+                )
+            elif item_type == "freeze":
+                days = item.get("days")
+                days_str = f"{days} дней" if days is not None else "—"
+                lines.append(f"\U0001f9ca {date_str} · Заморозка ({days_str})")
+            else:
+                # audit_log
+                line = f"\U0001f6e0\ufe0f {date_str} · Действие администратора"
+                try:
+                    payload = json.loads(item.get("new_value") or "{}")
+                except (ValueError, TypeError):
+                    payload = {}
+                delta = payload.get("delta")
+                if isinstance(delta, (int, float)):
+                    if delta > 0:
+                        line = (
+                            f"\U0001f6e0\ufe0f {date_str} · Админ добавил "
+                            f"{delta} {_plural_days(int(delta))}"
+                        )
+                    else:
+                        line = (
+                            f"\U0001f6e0\ufe0f {date_str} · Админ уменьшил срок на "
+                            f"{abs(delta)} {_plural_days(int(abs(delta)))}"
+                        )
+                lines.append(line)
+        text = "\n".join(lines)
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад к клиенту", callback_data=f"admin_user_{user_id}"
+            )
+        ]
+    ]
+    await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
+
+
+async def show_admin_subscription_history(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """История действий с абонементом клиента (только для админа).
+
+    Покупки (payments), заморозки (freezes), ручные корректировки и отмены
+    (audit_log по абонементам клиента). Последние 20 записей, DESC по дате.
+    """
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+
+    u = User.get_by_id(user_id)
+    if not u:
+        await safe_answer(
+            update.callback_query, "Пользователь не найден", show_alert=True
+        )
+        return
+
+    items = []
+    try:
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                # Покупки (payments)
+                cur.execute(
+                    """SELECT p.created_at AS date, p.amount, p.method,
+                              st.name AS type_name
+                       FROM payments p
+                       LEFT JOIN subscription_types st ON st.id = p.subscription_type_id
+                       WHERE p.user_id = %s AND p.status = 'paid'""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "purchase"
+                    items.append(row)
+
+                # Заморозки
+                cur.execute(
+                    """SELECT f.start_date AS date, f.days, f.status
+                       FROM freezes f
+                       JOIN subscriptions s ON s.id = f.subscription_id
+                       WHERE s.user_id = %s""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "freeze"
+                    items.append(row)
+
+                # Ручные корректировки часов/дней (audit_log)
+                cur.execute(
+                    """SELECT a.created_at AS date, a.action, a.new_value
+                       FROM audit_log a
+                       JOIN subscriptions s ON s.id = a.record_id
+                       WHERE s.user_id = %s AND a.table_name = 'subscriptions'
+                         AND a.action IN ('add_days', 'shorten_days', 'reset_manual')""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "adjustment"
+                    items.append(row)
+
+                # Отмены абонементов (audit_log)
+                cur.execute(
+                    """SELECT a.created_at AS date, a.action
+                       FROM audit_log a
+                       JOIN subscriptions s ON s.id = a.record_id
+                       WHERE s.user_id = %s AND a.table_name = 'subscriptions'
+                         AND a.action IN ('delete_subscription', 'cancel_subscription')""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "cancellation"
+                    items.append(row)
+    except Exception as e:
+        logger.error(
+            "Ошибка при загрузке истории абонемента клиента %s: %s",
+            user_id,
+            e,
+            exc_info=True,
+        )
+        await safe_answer(
+            update.callback_query, "Не удалось загрузить историю", show_alert=True
+        )
+        return
+
+    # Сортировка по дате DESC (datetime и date приводим к одному типу)
+    def _sort_key(x: dict):
+        value = x.get("date")
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+        return datetime.min
+
+    items.sort(key=_sort_key, reverse=True)
+    items = items[:20]
+
+    if not items:
+        text = "\U0001f4dc История абонемента\n\nПока нет записей."
+    else:
+        lines = [
+            f"\U0001f4dc История абонемента: {u['full_name'] or u['username'] or user_id}",
+            "",
+        ]
+        for item in items:
+            date_str = _format_date(item.get("date"))
+            item_type = item.get("type")
+            if item_type == "purchase":
+                amount = item.get("amount")
+                method = PAYMENT_METHOD_LABELS.get(
+                    item.get("method"), item.get("method") or "—"
+                )
+                type_name = item.get("type_name") or "Абонемент"
+                amount_str = f"{amount} BYN" if amount is not None else "—"
+                lines.append(
+                    f"\U0001f4e6 {date_str} · Куплен абонемент \"{type_name}\" "
+                    f"({amount_str}, {method})"
+                )
+            elif item_type == "freeze":
+                days = item.get("days")
+                days_str = f"{days} дней" if days is not None else "—"
+                lines.append(f"\U0001f9ca {date_str} · Заморозка на {days_str}")
+            elif item_type == "cancellation":
+                lines.append(f"\u274c {date_str} · Абонемент отменён")
+            else:
+                # adjustment (audit_log)
+                line = f"\U0001f6e0\ufe0f {date_str} · Действие администратора"
+                try:
+                    payload = json.loads(item.get("new_value") or "{}")
+                except (ValueError, TypeError):
+                    payload = {}
+                delta = payload.get("delta")
+                if isinstance(delta, (int, float)):
+                    if delta > 0:
+                        line = (
+                            f"\U0001f6e0\ufe0f {date_str} · Админ добавил "
+                            f"{delta} {_plural_days(int(delta))}"
+                        )
+                    else:
+                        line = (
+                            f"\U0001f6e0\ufe0f {date_str} · Админ уменьшил срок на "
+                            f"{abs(delta)} {_plural_days(int(abs(delta)))}"
+                        )
+                lines.append(line)
+        text = "\n".join(lines)
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад к клиенту", callback_data=f"admin_user_{user_id}"
+            )
+        ]
+    ]
+    await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
 
 
 async def show_admin_user_manage(

@@ -40,6 +40,8 @@ from handlers.admin import (
     admin_sub_cancel_handler,
     admin_sub_cancel_yes_handler,
     admin_sub_create_handler,
+    admin_sub_delete_handler,
+    admin_sub_delete_yes_handler,
     admin_sub_expires_handler,
     admin_sub_type_handler,
     admin_sub_visit_handler,
@@ -82,6 +84,7 @@ from handlers.admin_users import (
     handle_admin_user_unblock, admin_user_edit_start,
     admin_user_add_start, admin_user_delete_confirm, admin_user_delete_do,
     show_admin_user_delete_list, handle_admin_user_swap_name,
+    show_admin_user_history, show_admin_subscription_history,
 )
 from handlers.helpers import (
     FREEZE_MAX_DAYS,
@@ -104,10 +107,13 @@ from handlers.helpers import (
 from handlers.teacher import (
     handle_teacher_mark,
     show_teacher_class,
+    show_teacher_client_manage,
+    show_teacher_clients,
     show_teacher_panel,
     show_teacher_today,
     show_teacher_week,
 )
+from services.sales import PAYMENT_METHOD_LABELS
 from rag_agent import ask
 
 # Подавляем предупреждение PTBUserWarning от ConversationHandler
@@ -1217,6 +1223,15 @@ async def show_subscription_history(update: Update, context: ContextTypes.DEFAUL
                         f"({delta:+g} {_plural_days(int(delta))})"
                     )
                 lines.append(line)
+            elif item_type == "payment":
+                # Оплата из payments (только status='paid')
+                amount = item.get("amount")
+                method = PAYMENT_METHOD_LABELS.get(item.get("method"), item.get("method") or "—")
+                type_name = item.get("type_name") or "Абонемент"
+                amount_str = f"{amount} BYN" if amount is not None else "—"
+                lines.append(
+                    f"\U0001f4b3 {date_str} · Оплата: {amount_str} ({method}) · {type_name}"
+                )
             else:
                 # — visit —
                 visit_status = (item.get("status") or "").lower()
@@ -1256,7 +1271,7 @@ async def show_subscription_history(update: Update, context: ContextTypes.DEFAUL
 
 
 async def show_sub_freeze_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена активной заморозки клиентом (срок абонемента не меняется)."""
+    """Отмена активной заморозки клиентом: дни возвращаются к сроку абонемента."""
     query = update.callback_query
     await safe_answer(query)
 
@@ -1269,16 +1284,20 @@ async def show_sub_freeze_cancel(update: Update, context: ContextTypes.DEFAULT_T
     if not freeze:
         text = "У вас нет активной заморозки."
     else:
-        Freeze.cancel(freeze["id"])
+        # Завершаем заморозку: фактические дни возвращаются к сроку,
+        # счётчик использованных заморозок сбрасывается
+        Freeze.complete_and_revert(freeze["id"], date.today())
         logger.info(
-            "Пользователь %s отменил заморозку %s", user["id"], freeze["id"]
+            "Пользователь %s отменил заморозку %s (дни возвращены к сроку)",
+            user["id"],
+            freeze["id"],
         )
-        text = "\u274c Заморозка отменена."
+        text = "\u274c Заморозка отменена. Дни возвращены к сроку абонемента."
 
     keyboard = [
         [InlineKeyboardButton("\U0001f519 В меню", callback_data="my_subscription")]
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
 
 
 async def show_sub_buy_offline(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2322,6 +2341,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_admin_user_subs(update, context, uid)
             return
 
+    # История операций по клиенту — проверяем ДО admin_user_
+    if data.startswith("admin_user_history_"):
+        uid = _extract_int(data, "admin_user_history_")
+        if uid is not None:
+            await show_admin_user_history(update, context, uid)
+            return
+
+    # История абонемента (только админ) — проверяем ДО admin_user_
+    if data.startswith("admin_sub_history_"):
+        uid = _extract_int(data, "admin_sub_history_")
+        if uid is not None:
+            await show_admin_subscription_history(update, context, uid)
+            return
+
     # Карточка пользователя
     if data.startswith("admin_user_"):
         try:
@@ -2472,10 +2505,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await admin_sub_cancel_handler(update, context, sid)
             return
 
+    # Удаление (обнуление) абонемента: сначала подтверждение, затем исполнение
+    if data.startswith("admin_sub_delete_yes_"):
+        sid = _extract_int(data, "admin_sub_delete_yes_")
+        if sid is not None:
+            await admin_sub_delete_yes_handler(update, context, sid)
+            return
+
+    if data.startswith("admin_sub_delete_"):
+        sid = _extract_int(data, "admin_sub_delete_")
+        if sid is not None:
+            await admin_sub_delete_handler(update, context, sid)
+            return
+
     # --- Панель преподавателя ---
     if data == "teacher_panel":
         await show_teacher_panel(update, context)
         return
+
+    # Клиенты преподавателя: список и карточка
+    if data == "teacher_clients":
+        await show_teacher_clients(update, context, 1)
+        return
+
+    if data.startswith("teacher_clients_page_"):
+        page = _extract_int(data, "teacher_clients_page_")
+        if page is not None:
+            await show_teacher_clients(update, context, page)
+            return
+
+    if data.startswith("teacher_client_manage_"):
+        uid = _extract_int(data, "teacher_client_manage_")
+        if uid is not None:
+            await show_teacher_client_manage(update, context, uid)
+            return
 
     if data == "teacher_today":
         await show_teacher_today(update, context)

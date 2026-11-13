@@ -1,23 +1,31 @@
 """
-Хендлеры панели преподавателя: занятия, группы, отметка посещений.
+Хендлеры панели преподавателя: занятия, группы, отметка посещений, клиенты.
 Полностью работают на events_cache (расписание с сайта).
 """
 import logging
+import math
 from datetime import date, datetime, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, ConversationHandler
 
 from db.models import Booking, EventCache, Subscription, User, Visit
 from handlers.helpers import (
+    CLIENTS_PER_PAGE,
+    _extract_int,
     _format_date,
     _format_time,
     _require_teacher,
     _safe_edit,
+    _short_name,
+    format_client_card_info,
     safe_answer,
 )
 
 logger = logging.getLogger(__name__)
+
+# Состояние диалога поиска клиентов (панель преподавателя)
+TEACHER_CLIENTS_SEARCH = 60
 
 
 # ----------------------------------------------------------------------
@@ -39,6 +47,16 @@ async def show_teacher_panel(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [
             InlineKeyboardButton(
                 "\U0001f4c5 Расписание на неделю", callback_data="teacher_week"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f6d2 Продать абонемент", callback_data="teacher_sell"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f465 Клиенты", callback_data="teacher_clients"
             )
         ],
         [InlineKeyboardButton("\U0001f519 Главное меню", callback_data="back_to_main")],
@@ -261,3 +279,176 @@ async def handle_teacher_mark(
         await show_teacher_class(update, context, em_event_id)
     else:
         await show_teacher_today(update, context)
+
+
+# ----------------------------------------------------------------------
+# Клиенты (панель преподавателя)
+# ----------------------------------------------------------------------
+async def show_teacher_clients(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1
+):
+    """Список клиентов с пагинацией (по 10) и поиском."""
+    teacher = await _require_teacher(update, context)
+    if not teacher:
+        return
+
+    total = User.count_students_for_admin("all")
+    total_pages = max(1, math.ceil(total / CLIENTS_PER_PAGE))
+    page = max(1, min(page, total_pages))
+    users = User.get_students_for_admin(
+        "all", limit=CLIENTS_PER_PAGE, offset=(page - 1) * CLIENTS_PER_PAGE
+    )
+
+    lines = [f"\U0001f465 Клиенты (Всего: {total})", ""]
+    keyboard = []
+    for u in users:
+        name = _short_name(u.get("full_name") or u.get("username") or f"ID {u['id']}")
+        lines.append(f"• {name}")
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    name, callback_data=f"teacher_client_manage_{u['id']}"
+                )
+            ]
+        )
+
+    # Пагинация
+    nav = []
+    if page > 1:
+        nav.append(
+            InlineKeyboardButton(
+                "\u2b05\ufe0f", callback_data=f"teacher_clients_page_{page - 1}"
+            )
+        )
+    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="teacher_clients_noop"))
+    if page < total_pages:
+        nav.append(
+            InlineKeyboardButton(
+                "\u27a1\ufe0f", callback_data=f"teacher_clients_page_{page + 1}"
+            )
+        )
+    keyboard.append(nav)
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f50d Поиск", callback_data="teacher_clients_search")]
+    )
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_panel")]
+    )
+    await _safe_edit(update, "\n".join(lines), InlineKeyboardMarkup(keyboard))
+
+
+async def show_teacher_client_manage(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """Карточка клиента для преподавателя: ФИО, телефон, абонемент, продажа."""
+    teacher = await _require_teacher(update, context)
+    if not teacher:
+        return
+
+    u = User.get_by_id(user_id)
+    if not u:
+        await safe_answer(update.callback_query, "Клиент не найден", show_alert=True)
+        return
+
+    text = (
+        f"\U0001f464 {u['full_name'] or '—'}\n"
+        f"\U0001f4f1 Телефон: {u['phone'] or '—'}\n"
+        f"{format_client_card_info(user_id)}"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\U0001f6d2 Продать абонемент",
+                callback_data=f"teacher_sell_manage_{user_id}",
+            )
+        ],
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="teacher_clients")],
+    ]
+    await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
+
+
+async def teacher_client_manage_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатия на клиента из результатов поиска (ConversationHandler)."""
+    query = update.callback_query
+    user_id = _extract_int(query.data, "teacher_client_manage_")
+    if user_id is not None:
+        await show_teacher_client_manage(update, context, user_id)
+    return ConversationHandler.END
+
+
+async def teacher_clients_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрос Telegram ID или ФИО клиента для поиска."""
+    teacher = await _require_teacher(update, context)
+    if not teacher:
+        return ConversationHandler.END
+    await _safe_edit(
+        update,
+        "\U0001f50d Введите Telegram ID клиента или ФИО\n"
+        "(например: 123456789 или Иванова Анна):",
+    )
+    return TEACHER_CLIENTS_SEARCH
+
+
+async def teacher_clients_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Поиск клиента по Telegram ID или ФИО (текстовый ввод)."""
+    teacher = await _require_teacher(update, context)
+    if not teacher:
+        return ConversationHandler.END
+    raw = update.message.text.strip()
+
+    # Поиск по Telegram ID
+    if raw.isdigit():
+        user = User.get_by_telegram_id(int(raw))
+        if user:
+            await show_teacher_client_manage(update, context, user["id"])
+            return ConversationHandler.END
+        await update.message.reply_text(
+            "Пользователь с таким Telegram ID не найден. Попробуйте ещё раз или /cancel."
+        )
+        return TEACHER_CLIENTS_SEARCH
+
+    # Поиск по ФИО/username (подстрока)
+    students = User.get_students_for_admin(limit=200)
+    needle = raw.lower()
+    matches = [
+        u
+        for u in students
+        if needle in (u.get("full_name") or "").lower()
+        or needle in (u.get("username") or "").lower()
+    ]
+    if len(matches) == 1:
+        await show_teacher_client_manage(update, context, matches[0]["id"])
+        return ConversationHandler.END
+    if len(matches) > 1:
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    _short_name(u.get("full_name") or u.get("username") or f"ID {u['id']}"),
+                    callback_data=f"teacher_client_manage_{u['id']}",
+                )
+            ]
+            for u in matches[:10]
+        ]
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f519 Отмена", callback_data="teacher_clients_cancel"
+                )
+            ]
+        )
+        await update.message.reply_text(
+            "Найдено несколько клиентов. Уточните выбор:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return TEACHER_CLIENTS_SEARCH
+
+    await update.message.reply_text("Никого не найдено. Попробуйте ещё раз или /cancel.")
+    return TEACHER_CLIENTS_SEARCH
+
+
+async def teacher_clients_search_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена поиска клиентов (кнопка или /cancel) — возврат к списку."""
+    if update.callback_query:
+        await safe_answer(update.callback_query)
+    await show_teacher_clients(update, context, 1)
+    return ConversationHandler.END

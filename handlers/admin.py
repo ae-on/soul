@@ -21,6 +21,7 @@ from telegram.ext import (
 from db.connection import get_connection
 from db.models import (
     AuditLog,
+    Booking,
     Freeze,
     Subscription,
     SubscriptionType,
@@ -318,6 +319,14 @@ async def show_admin_user_subs(
     keyboard.append(
         [
             InlineKeyboardButton(
+                "\U0001f6d2 Продать абонемент",
+                callback_data=f"admin_sell_{user_id}",
+            )
+        ]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton(
                 "\U0001f519 К карточке юзера",
                 callback_data=f"admin_user_{user_id}",
             )
@@ -594,6 +603,14 @@ async def show_admin_sub_manage(
             InlineKeyboardButton(
                 "\u274c Отменить абонемент",
                 callback_data=f"admin_sub_cancel_{sub_id}",
+            )
+        ]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "\U0001f5d1\ufe0f Удалить (обнулить)",
+                callback_data=f"admin_sub_delete_{sub_id}",
             )
         ]
     )
@@ -1441,5 +1458,111 @@ async def admin_sub_cancel_yes_handler(
 
     Subscription.set_status(sub_id, "cancelled")
     logger.info("Админ %s отменил абонемент %s", admin["id"], sub_id)
+    # Пишем в audit_log (для истории абонемента)
+    try:
+        AuditLog.create(
+            user_id=admin["id"],
+            action="cancel_subscription",
+            table_name="subscriptions",
+            record_id=sub_id,
+            new_value=json.dumps({"status": "cancelled"}),
+        )
+    except Exception as e:
+        logger.error("Не удалось записать audit_log: %s", e)
     # Возвращаемся к списку абонементов пользователя
     await show_admin_user_subs(update, context, sub["user_id"])
+
+
+async def admin_sub_delete_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
+):
+    """Подтверждение удаления (обнуления) абонемента."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    sub = Subscription.get_by_id(sub_id)
+    if not sub:
+        await safe_answer(query, "Абонемент не найден", show_alert=True)
+        return
+
+    hours_left = sub.get("hours_left")
+    left_str = f"{hours_left}ч" if hours_left is not None else "безлимит"
+    text = (
+        f"\U0001f5d1\ufe0f Удалить (обнулить) абонемент?\n\n"
+        f"Остаток {left_str} сгорит, будущие записи будут отменены."
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\u2705 Да, удалить",
+                callback_data=f"admin_sub_delete_yes_{sub_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Нет", callback_data=f"admin_sub_manage_{sub_id}"
+            )
+        ],
+    ]
+    await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
+
+
+async def admin_sub_delete_yes_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, sub_id: int
+):
+    """Фактическое удаление (обнуление) абонемента."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    sub = Subscription.get_by_id(sub_id)
+    if not sub:
+        await safe_answer(query, "Абонемент не найден", show_alert=True)
+        return
+
+    # 1. status='cancelled', hours_left=0
+    Subscription.update(sub_id, status="cancelled", hours_left=0)
+
+    # 2. Отменяем будущие записи клиента
+    cancelled_bookings = Booking.cancel_future_for_user(sub["user_id"])
+
+    # 3. AuditLog
+    AuditLog.create(
+        user_id=admin["id"],
+        action="delete_subscription",
+        table_name="subscriptions",
+        record_id=sub_id,
+        new_value=json.dumps(
+            {
+                "status": "cancelled",
+                "hours_left": 0,
+                "bookings_cancelled": cancelled_bookings,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    logger.info("Админ %s удалил (обнулил) абонемент %s", admin["id"], sub_id)
+
+    # 4. Уведомляем клиента
+    client = User.get_by_id(sub["user_id"]) if sub.get("user_id") else None
+    if client and client.get("telegram_id"):
+        try:
+            await context.bot.send_message(
+                chat_id=client["telegram_id"],
+                text="\U0001f5d1\ufe0f Ваш абонемент был удален администратором.",
+            )
+        except Exception as e:
+            logger.error(
+                "Не удалось уведомить клиента %s: %s", client["telegram_id"], e
+            )
+
+    # 5. Возвращаемся к списку абонементов пользователя
+    await show_admin_user_subs(
+        update,
+        context,
+        sub["user_id"],
+        notice="\U0001f5d1\ufe0f Абонемент удалён (обнулён)",
+    )

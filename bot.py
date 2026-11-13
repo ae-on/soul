@@ -87,6 +87,23 @@ from handlers.admin_users import (
     admin_user_edit_start,
     admin_user_edit_value,
 )
+from handlers.admin_subs import (
+    SELL_CLIENT,
+    SELL_DATE,
+    SELL_PAYMENT,
+    SELL_TYPE,
+    admin_sell_cancel,
+    admin_sell_date_today,
+    admin_sell_date_text,
+    admin_sell_payment,
+    admin_sell_start,
+    admin_sell_type,
+    teacher_sell_client,
+    teacher_sell_client_manage,
+    teacher_sell_client_text,
+    teacher_sell_search,
+    teacher_sell_start,
+)
 from handlers.admin_types import (
     ADD_DAYS, ADD_HOURS, ADD_NAME, ADD_PRICE,
     EDIT_HOURS, EDIT_PRICE,
@@ -96,6 +113,13 @@ from handlers.admin_types import (
     admin_type_edit_price_start, admin_type_edit_price_value,
 )
 from handlers.helpers import check_and_complete_freeze
+from handlers.teacher import (
+    TEACHER_CLIENTS_SEARCH,
+    teacher_client_manage_cb,
+    teacher_clients_search,
+    teacher_clients_search_cancel,
+    teacher_clients_search_text,
+)
 
 
 def main():
@@ -255,6 +279,62 @@ def main():
         fallbacks=[CommandHandler("cancel", admin_type_add_cancel)],
     )
 
+    # ConversationHandler продажи абонемента (админка + преподаватель)
+    admin_sell_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_sell_start, pattern=r"^admin_sell_\d+$"),
+            CallbackQueryHandler(teacher_sell_start, pattern=r"^teacher_sell$"),
+            CallbackQueryHandler(
+                teacher_sell_client_manage, pattern=r"^teacher_sell_manage_\d+$"
+            ),
+        ],
+        states={
+            SELL_CLIENT: [
+                CallbackQueryHandler(teacher_sell_client, pattern=r"^teacher_sell_client_\d+$"),
+                CallbackQueryHandler(teacher_sell_search, pattern=r"^teacher_sell_search$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, teacher_sell_client_text),
+                CallbackQueryHandler(admin_sell_cancel, pattern=r"^admin_sell_cancel$"),
+            ],
+            SELL_TYPE: [
+                CallbackQueryHandler(admin_sell_type, pattern=r"^admin_sell_type_\d+_\d+$"),
+                CallbackQueryHandler(admin_sell_cancel, pattern=r"^admin_sell_cancel$"),
+            ],
+            SELL_DATE: [
+                CallbackQueryHandler(admin_sell_date_today, pattern=r"^admin_sell_date_today$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_sell_date_text),
+                CallbackQueryHandler(admin_sell_cancel, pattern=r"^admin_sell_cancel$"),
+            ],
+            SELL_PAYMENT: [
+                CallbackQueryHandler(admin_sell_payment, pattern=r"^admin_sell_pay_"),
+                CallbackQueryHandler(admin_sell_cancel, pattern=r"^admin_sell_cancel$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin_sell_cancel)],
+    )
+
+    # ConversationHandler поиска клиентов (панель преподавателя)
+    teacher_clients_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(
+                teacher_clients_search, pattern=r"^teacher_clients_search$"
+            ),
+        ],
+        states={
+            TEACHER_CLIENTS_SEARCH: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, teacher_clients_search_text
+                ),
+                CallbackQueryHandler(
+                    teacher_client_manage_cb, pattern=r"^teacher_client_manage_\d+$"
+                ),
+                CallbackQueryHandler(
+                    teacher_clients_search_cancel, pattern=r"^teacher_clients_cancel$"
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", teacher_clients_search_cancel)],
+    )
+
     # -----------------------------------------------------------------------
     # Error handler
     # -----------------------------------------------------------------------
@@ -280,6 +360,8 @@ def main():
     application.add_handler(admin_type_edit_price_conv)
     application.add_handler(admin_type_edit_hours_conv)
     application.add_handler(admin_type_add_conv)
+    application.add_handler(admin_sell_conv)
+    application.add_handler(teacher_clients_conv)
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
     )
