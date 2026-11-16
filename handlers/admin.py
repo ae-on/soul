@@ -1566,3 +1566,24 @@ async def admin_sub_delete_yes_handler(
         sub["user_id"],
         notice="\U0001f5d1\ufe0f Абонемент удалён (обнулён)",
     )
+
+
+async def admin_sub_edit_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """Подменю «Изменить абонемент» для активного абонемента клиента.
+
+    Открывает экран управления абонементом (часы, срок, заморозка).
+    """
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+
+    sub = Subscription.get_active_for_user(user_id)
+    if not sub:
+        await safe_answer(
+            update.callback_query, "Нет активного абонемента", show_alert=True
+        )
+        return
+
+    await show_admin_sub_manage(update, context, sub["id"])

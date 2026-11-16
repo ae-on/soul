@@ -682,7 +682,8 @@ async def show_admin_user_manage(
         f"Телефон: {u['phone'] or '—'}\n"
         f"Email: {u.get('email') or '—'}\n"
         f"Статус: {u['status']}\n"
-        f"Роли: {roles_str}"
+        f"Роли: {roles_str}\n"
+        f"{format_client_card_info(user_id)}"
     )
 
     keyboard = [
@@ -711,6 +712,28 @@ async def show_admin_user_manage(
             )
         ],
     ]
+
+    # Изменение параметров абонемента — только если есть активный абонемент
+    if Subscription.get_active_for_user(user_id):
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\u270f\ufe0f Изменить абонемент",
+                    callback_data=f"admin_sub_edit_{user_id}",
+                )
+            ]
+        )
+
+    # История действий с абонементом
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "\U0001f4dc История абонемента",
+                callback_data=f"admin_sub_history_{user_id}",
+            )
+        ]
+    )
+
     if u["status"] != "inactive":
         keyboard.append(
             [
@@ -733,10 +756,7 @@ async def show_admin_user_manage(
     )
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    if update.callback_query:
-        await _safe_edit(update.callback_query, text, reply_markup)
-    else:
-        await update.message.reply_text(text, reply_markup=reply_markup)
+    await _safe_edit(update, text, reply_markup)
 
 
 # ----------------------------------------------------------------------

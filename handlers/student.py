@@ -42,6 +42,7 @@ from handlers.admin import (
     admin_sub_create_handler,
     admin_sub_delete_handler,
     admin_sub_delete_yes_handler,
+    admin_sub_edit_handler,
     admin_sub_expires_handler,
     admin_sub_type_handler,
     admin_sub_visit_handler,
@@ -2353,6 +2354,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = _extract_int(data, "admin_sub_history_")
         if uid is not None:
             await show_admin_subscription_history(update, context, uid)
+            return
+
+    # Подменю «Изменить абонемент» (админка)
+    if data.startswith("admin_sub_edit_"):
+        uid = _extract_int(data, "admin_sub_edit_")
+        if uid is not None:
+            await admin_sub_edit_handler(update, context, uid)
             return
 
     # Карточка пользователя
