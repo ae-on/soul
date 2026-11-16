@@ -44,12 +44,18 @@ ADMIN_USER_EDIT = 20
 # Состояния диалога добавления пользователя админом
 ADMIN_USER_ADD_NAME, ADMIN_USER_ADD_PHONE, ADMIN_USER_ADD_TG, ADMIN_USER_ADD_EMAIL = 21, 22, 23, 24
 
-# Подписи полей, доступных для редактирования через CRUD-карточку
+# Подписи полей, доступных для редактирования через подменю «Редактировать профиль»
 ADMIN_USER_FIELD_LABELS = {
     "name": "ФИО",
     "phone": "Телефон",
     "email": "Email",
+    "status": "Статус",
+    "telegram_id": "Telegram ID",
+    "username": "Имя в телеграм",
 }
+
+# Допустимые значения статуса пользователя
+USER_STATUS_VALUES = ("active", "inactive", "new", "archived", "expired", "deleted_data")
 
 
 # ----------------------------------------------------------------------
@@ -501,12 +507,12 @@ async def show_admin_user_history(
 
 
 async def show_admin_subscription_history(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, page: int = 1
 ):
     """История действий с абонементом клиента (только для админа).
 
     Покупки (payments), заморозки (freezes), ручные корректировки и отмены
-    (audit_log по абонементам клиента). Последние 20 записей, DESC по дате.
+    (audit_log по абонементам клиента). Пагинация по 20 записей, DESC по дате.
     """
     admin = await _require_admin(update, context)
     if not admin:
@@ -595,16 +601,22 @@ async def show_admin_subscription_history(
         return datetime.min
 
     items.sort(key=_sort_key, reverse=True)
-    items = items[:20]
+
+    # Пагинация по 20 записей
+    HISTORY_PER_PAGE = 20
+    total_pages = max(1, math.ceil(len(items) / HISTORY_PER_PAGE))
+    page = max(1, min(page, total_pages))
+    page_items = items[(page - 1) * HISTORY_PER_PAGE : page * HISTORY_PER_PAGE]
 
     if not items:
         text = "\U0001f4dc История абонемента\n\nПока нет записей."
     else:
         lines = [
             f"\U0001f4dc История абонемента: {u['full_name'] or u['username'] or user_id}",
+            f"Страница {page} из {total_pages}",
             "",
         ]
-        for item in items:
+        for item in page_items:
             date_str = _format_date(item.get("date"))
             item_type = item.get("type")
             if item_type == "purchase":
@@ -646,20 +658,177 @@ async def show_admin_subscription_history(
                 lines.append(line)
         text = "\n".join(lines)
 
+    keyboard = []
+    # Пагинация
+    nav = []
+    if page > 1:
+        nav.append(
+            InlineKeyboardButton(
+                "\u2b05\ufe0f",
+                callback_data=f"admin_sub_history_page_{user_id}_{page - 1}",
+            )
+        )
+    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(
+            InlineKeyboardButton(
+                "\u27a1\ufe0f",
+                callback_data=f"admin_sub_history_page_{user_id}_{page + 1}",
+            )
+        )
+    keyboard.append(nav)
+    # Очистка истории (audit_log)
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "\U0001f9f9 Очистить старые (>30 дней)",
+                callback_data=f"admin_sub_history_clear_old_{user_id}",
+            ),
+            InlineKeyboardButton(
+                "\U0001f9f9 Очистить все",
+                callback_data=f"admin_sub_history_clear_all_{user_id}",
+            ),
+        ]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад к клиенту",
+                callback_data=f"admin_user_manage_{user_id}",
+            )
+        ]
+    )
+    await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
+
+
+async def admin_sub_history_clear_old(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """Подтверждение очистки записей истории старше 30 дней."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    text = (
+        "\U0001f9f9 Очистить историю абонемента старше 30 дней?\n\n"
+        "Будут удалены записи audit_log (действия администратора) старше 30 дней. "
+        "Платежи и заморозки не затрагиваются."
+    )
     keyboard = [
         [
             InlineKeyboardButton(
-                "\U0001f519 Назад к клиенту", callback_data=f"admin_user_{user_id}"
+                "\u2705 Да, очистить",
+                callback_data=f"admin_sub_history_clear_old_yes_{user_id}",
             )
-        ]
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Нет", callback_data=f"admin_sub_history_{user_id}"
+            )
+        ],
     ]
     await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
+
+
+async def admin_sub_history_clear_old_yes(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """Удаление записей audit_log старше 30 дней по абонементам клиента."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """DELETE FROM audit_log
+                       WHERE table_name = 'subscriptions'
+                         AND record_id IN (SELECT id FROM subscriptions WHERE user_id = %s)
+                         AND created_at < NOW() - INTERVAL 30 DAY""",
+                    (user_id,),
+                )
+                conn.commit()
+                deleted = cur.rowcount
+    except Exception as e:
+        logger.error(
+            "Ошибка очистки истории клиента %s: %s", user_id, e, exc_info=True
+        )
+        await safe_answer(query, "Не удалось очистить историю", show_alert=True)
+        return
+    logger.info(
+        "Админ %s очистил историю (>30 дней) клиента %s: %s записей",
+        admin["id"], user_id, deleted,
+    )
+    await safe_answer(query, f"\u2705 Удалено записей: {deleted}", show_alert=True)
+    await show_admin_subscription_history(update, context, user_id)
+
+
+async def admin_sub_history_clear_all(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """Подтверждение полной очистки истории абонемента."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    text = (
+        "\U0001f9f9 Очистить ВСЮ историю абонемента?\n\n"
+        "Будут удалены все записи audit_log (действия администратора) "
+        "по абонементам клиента. Платежи и заморозки не затрагиваются. "
+        "Действие необратимо."
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\u2705 Да, очистить всё",
+                callback_data=f"admin_sub_history_clear_all_yes_{user_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Нет", callback_data=f"admin_sub_history_{user_id}"
+            )
+        ],
+    ]
+    await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
+
+
+async def admin_sub_history_clear_all_yes(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """Полное удаление записей audit_log по абонементам клиента."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """DELETE FROM audit_log
+                       WHERE table_name = 'subscriptions'
+                         AND record_id IN (SELECT id FROM subscriptions WHERE user_id = %s)""",
+                    (user_id,),
+                )
+                conn.commit()
+                deleted = cur.rowcount
+    except Exception as e:
+        logger.error(
+            "Ошибка полной очистки истории клиента %s: %s", user_id, e, exc_info=True
+        )
+        await safe_answer(query, "Не удалось очистить историю", show_alert=True)
+        return
+    logger.info(
+        "Админ %s очистил всю историю клиента %s: %s записей",
+        admin["id"], user_id, deleted,
+    )
+    await safe_answer(query, f"\u2705 Удалено записей: {deleted}", show_alert=True)
+    await show_admin_subscription_history(update, context, user_id)
 
 
 async def show_admin_user_manage(
     update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
 ):
-    """CRUD-карточка пользователя: редактирование полей, роли, блокировка."""
+    """Карточка клиента: меню действий (профиль, абонемент, история, блокировка)."""
     admin = await _require_admin(update, context)
     if not admin:
         return
@@ -689,42 +858,23 @@ async def show_admin_user_manage(
     keyboard = [
         [
             InlineKeyboardButton(
-                "\u270f\ufe0f Имя", callback_data=f"admin_user_edit_{user_id}_name"
-            ),
-            InlineKeyboardButton(
-                "\U0001f504 Поменять Имя/Фамилию",
-                callback_data=f"admin_user_swap_name_{user_id}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "\U0001f4f1 Телефон", callback_data=f"admin_user_edit_{user_id}_phone"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "\U0001f4e7 Email", callback_data=f"admin_user_edit_{user_id}_email"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "\U0001f3ab Роли", callback_data=f"admin_user_roles_{user_id}"
+                "\u270f\ufe0f Редактировать профиль",
+                callback_data=f"admin_profile_menu_{user_id}",
             )
         ],
     ]
 
-    # Изменение параметров абонемента — только если есть активный абонемент
+    # Редактирование абонемента — только если есть активный абонемент
     if Subscription.get_active_for_user(user_id):
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    "\u270f\ufe0f Изменить абонемент",
+                    "\u270f\ufe0f Редактировать абонемент",
                     callback_data=f"admin_sub_edit_{user_id}",
                 )
             ]
         )
 
-    # История действий с абонементом
     keyboard.append(
         [
             InlineKeyboardButton(
@@ -738,7 +888,8 @@ async def show_admin_user_manage(
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    "\U0001f6ab Блок", callback_data=f"admin_user_block_{user_id}"
+                    "\U0001f512 Блокировка клиента",
+                    callback_data=f"admin_user_block_{user_id}",
                 )
             ]
         )
@@ -759,6 +910,77 @@ async def show_admin_user_manage(
     await _safe_edit(update, text, reply_markup)
 
 
+async def show_admin_profile_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """Подменю «Редактировать профиль»: поля профиля клиента."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+
+    u = User.get_by_id(user_id)
+    if not u:
+        await safe_answer(
+            update.callback_query, "Пользователь не найден", show_alert=True
+        )
+        return
+
+    roles = UserRole.get_active_roles(user_id)
+    roles_str = ", ".join(roles) if roles else "—"
+
+    text = (
+        f"\U0001f464 {u['full_name'] or '—'}\n"
+        f"ID в БД: {u['id']}\n"
+        f"Telegram ID: {u['telegram_id']}\n"
+        f"Username: @{u['username'] or '—'}\n"
+        f"Телефон: {u['phone'] or '—'}\n"
+        f"Email: {u.get('email') or '—'}\n"
+        f"Статус: {u['status']}\n"
+        f"Роли: {roles_str}\n\n"
+        "Что изменить?"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\u270f\ufe0f Имя", callback_data=f"admin_user_edit_{user_id}_name"
+            ),
+            InlineKeyboardButton(
+                "\U0001f4f1 Телефон", callback_data=f"admin_user_edit_{user_id}_phone"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f4e7 Email", callback_data=f"admin_user_edit_{user_id}_email"
+            ),
+            InlineKeyboardButton(
+                "\U0001f3ab Роли", callback_data=f"admin_profile_roles_{user_id}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f4cc Статус", callback_data=f"admin_user_edit_{user_id}_status"
+            ),
+            InlineKeyboardButton(
+                "\U0001f194 Telegram ID",
+                callback_data=f"admin_user_edit_{user_id}_telegram_id",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f464 Имя в телеграм",
+                callback_data=f"admin_user_edit_{user_id}_username",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Назад", callback_data=f"admin_user_manage_{user_id}"
+            ),
+        ],
+    ]
+    await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
+
+
 # ----------------------------------------------------------------------
 # Редактирование полей пользователя (имя/телефон/email)
 # ----------------------------------------------------------------------
@@ -772,7 +994,7 @@ async def admin_user_edit_start(update: Update, context: ContextTypes.DEFAULT_TY
     # callback: admin_user_edit_{user_id}_{field}
     try:
         rest = query.data[len("admin_user_edit_"):]
-        user_id_str, field = rest.split("_")
+        user_id_str, field = rest.split("_", 1)
         user_id = int(user_id_str)
     except (ValueError, AttributeError):
         await query.edit_message_text("Ошибка: неверный ID пользователя.")
@@ -794,11 +1016,22 @@ async def admin_user_edit_start(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["admin_user_edit_user_id"] = user_id
     context.user_data["admin_user_edit_field"] = field
 
+    hint = ""
+    if field == "status":
+        hint = (
+            "\n\nДопустимые значения: "
+            + ", ".join(USER_STATUS_VALUES)
+        )
+    elif field == "telegram_id":
+        hint = "\n\nВведите число или «-», чтобы очистить."
+    elif field == "username":
+        hint = "\n\nБез символа @ (например: ivanova_anna)."
+
     text = (
         f"\u270f\ufe0f Изменение «{label}»\n\n"
         f"Пользователь: {target.get('full_name') or target.get('username') or user_id}\n"
         f"Текущее значение: {current}\n\n"
-        f"Введите новое значение для «{label}»:"
+        f"Введите новое значение для «{label}»:{hint}"
     )
     keyboard = [[InlineKeyboardButton("\U0001f519 Отмена", callback_data="admin_user_cancel")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -823,10 +1056,24 @@ async def admin_user_edit_value(update: Update, context: ContextTypes.DEFAULT_TY
         error_text = "\u26a0\ufe0f Телефон должен содержать не менее 7 цифр. Введите ещё раз:"
     elif field == "email" and not re.match(r"^[^@\s]+@[^@\s]+$", value):
         error_text = "\u26a0\ufe0f Неверный email. Введите ещё раз:"
+    elif field == "status" and value not in USER_STATUS_VALUES:
+        error_text = (
+            "\u26a0\ufe0f Неверный статус. Допустимо: "
+            + ", ".join(USER_STATUS_VALUES)
+            + ". Введите ещё раз:"
+        )
+    elif field == "telegram_id":
+        if value != "-" and not value.isdigit():
+            error_text = "\u26a0\ufe0f Telegram ID должен быть числом или «-». Введите ещё раз:"
+    elif field == "username":
+        value = value.lstrip("@")
 
     if error_text:
         await update.message.reply_text(error_text)
         return ADMIN_USER_EDIT
+
+    if field == "telegram_id":
+        value = None if value == "-" else int(value)
 
     db_field = "full_name" if field == "name" else field
     User.update_field(user_id, db_field, value)
@@ -841,7 +1088,7 @@ async def admin_user_edit_value(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data.pop("admin_user_edit_field", None)
 
     await update.message.reply_text(f"\u2705 {label} обновлено.")
-    await show_admin_user_manage(update, context, user_id)
+    await show_admin_profile_menu(update, context, user_id)
     return ConversationHandler.END
 
 
@@ -860,7 +1107,7 @@ async def admin_user_edit_cancel(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("\u270f\ufe0f Редактирование отменено.")
 
     if user_id:
-        await show_admin_user_manage(update, context, user_id)
+        await show_admin_profile_menu(update, context, user_id)
     return ConversationHandler.END
 
 
@@ -918,15 +1165,6 @@ async def handle_admin_user_block(
     u = User.get_by_id(user_id)
     if not u:
         await safe_answer(query, "Пользователь не найден", show_alert=True)
-        return
-
-    # Нельзя заблокировать пользователя с активным абонементом
-    if Subscription.get_active_for_user(user_id):
-        await safe_answer(
-            query,
-            "Нельзя заблокировать: у клиента есть активный абонемент.",
-            show_alert=True,
-        )
         return
 
     User.set_status(user_id, "inactive")
@@ -1050,12 +1288,23 @@ async def show_admin_user_roles(
                 ]
             )
 
+    # Возврат в меню, из которого открыли роли
+    back_callback = context.user_data.get("roles_back") or "admin_roles"
     keyboard.append(
-        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_roles")]
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data=back_callback)]
     )
-    await update.callback_query.edit_message_text(
-        text, reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
+
+
+async def admin_profile_roles(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
+):
+    """Открыть управление ролями из подменю «Редактировать профиль»."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    context.user_data["roles_back"] = f"admin_profile_menu_{user_id}"
+    await show_admin_user_roles(update, context, user_id)
 
 
 async def show_admin_role_grant(

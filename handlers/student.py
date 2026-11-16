@@ -86,6 +86,9 @@ from handlers.admin_users import (
     admin_user_add_start, admin_user_delete_confirm, admin_user_delete_do,
     show_admin_user_delete_list, handle_admin_user_swap_name,
     show_admin_user_history, show_admin_subscription_history,
+    show_admin_profile_menu, admin_profile_roles,
+    admin_sub_history_clear_old, admin_sub_history_clear_old_yes,
+    admin_sub_history_clear_all, admin_sub_history_clear_all_yes,
 )
 from handlers.helpers import (
     FREEZE_MAX_DAYS,
@@ -2281,6 +2284,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_admin_user_manage(update, context, uid)
             return
 
+    # Подменю «Редактировать профиль»
+    if data.startswith("admin_profile_menu_"):
+        uid = _extract_int(data, "admin_profile_menu_")
+        if uid is not None:
+            await show_admin_profile_menu(update, context, uid)
+            return
+
+    # Роли из подменю профиля (возврат в подменю)
+    if data.startswith("admin_profile_roles_"):
+        uid = _extract_int(data, "admin_profile_roles_")
+        if uid is not None:
+            await admin_profile_roles(update, context, uid)
+            return
+
     if data.startswith("admin_user_block_"):
         uid = _extract_int(data, "admin_user_block_")
         if uid is not None:
@@ -2330,6 +2347,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("admin_user_roles_"):
         try:
             uid = int(data[len("admin_user_roles_"):])
+            # Вход из карточки — возврат в список ролей, а не в подменю профиля
+            context.user_data.pop("roles_back", None)
             await show_admin_user_roles(update, context, uid)
             return
         except (ValueError, IndexError):
@@ -2350,6 +2369,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # История абонемента (только админ) — проверяем ДО admin_user_
+    if data.startswith("admin_sub_history_clear_old_yes_"):
+        uid = _extract_int(data, "admin_sub_history_clear_old_yes_")
+        if uid is not None:
+            await admin_sub_history_clear_old_yes(update, context, uid)
+            return
+
+    if data.startswith("admin_sub_history_clear_old_"):
+        uid = _extract_int(data, "admin_sub_history_clear_old_")
+        if uid is not None:
+            await admin_sub_history_clear_old(update, context, uid)
+            return
+
+    if data.startswith("admin_sub_history_clear_all_yes_"):
+        uid = _extract_int(data, "admin_sub_history_clear_all_yes_")
+        if uid is not None:
+            await admin_sub_history_clear_all_yes(update, context, uid)
+            return
+
+    if data.startswith("admin_sub_history_clear_all_"):
+        uid = _extract_int(data, "admin_sub_history_clear_all_")
+        if uid is not None:
+            await admin_sub_history_clear_all(update, context, uid)
+            return
+
+    if data.startswith("admin_sub_history_page_"):
+        # admin_sub_history_page_{user_id}_{page}
+        parts = data[len("admin_sub_history_page_"):].split("_", 1)
+        if len(parts) == 2:
+            try:
+                uid = int(parts[0])
+                page = int(parts[1])
+                await show_admin_subscription_history(update, context, uid, page)
+                return
+            except ValueError:
+                pass
+
     if data.startswith("admin_sub_history_"):
         uid = _extract_int(data, "admin_sub_history_")
         if uid is not None:
@@ -2402,6 +2457,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("admin_sub_manage_"):
         sid = _extract_int(data, "admin_sub_manage_")
         if sid is not None:
+            # Вход из списка абонементов — возврат в список, а не в карточку клиента
+            context.user_data.pop("sub_back", None)
             await show_admin_sub_manage(update, context, sid)
             return
 

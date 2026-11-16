@@ -206,7 +206,10 @@ def main():
     # ConversationHandler редактирования полей пользователя (админка)
     admin_user_edit_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(admin_user_edit_start, pattern=r"^admin_user_edit_\d+_(name|phone|email)$")
+            CallbackQueryHandler(
+                admin_user_edit_start,
+                pattern=r"^admin_user_edit_\d+_(name|phone|email|status|telegram_id|username)$",
+            )
         ],
         states={
             ADMIN_USER_EDIT: [

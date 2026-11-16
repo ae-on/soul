@@ -73,10 +73,10 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [InlineKeyboardButton("\U0001f465 Клиенты", callback_data="admin_clients")],
-        [InlineKeyboardButton("\U0001f4c5 Слоты и группы", callback_data="admin_slots")],
         [InlineKeyboardButton("\U0001f9d1\u200d\U0001f3eb Учителя", callback_data="admin_teachers")],
         [InlineKeyboardButton("\U0001f527 Админы", callback_data="admin_admins")],
-        [InlineKeyboardButton("\U0001f3ab Тарифы", callback_data="admin_types")],
+        [InlineKeyboardButton("\U0001f4c5 Расписание занятий", callback_data="admin_slots")],
+        [InlineKeyboardButton("\U0001f3ab Абонементы", callback_data="admin_types")],
         [InlineKeyboardButton("\U0001f519 Главное меню", callback_data="back_to_main")],
     ]
     text = "\U0001f527 Панель администратора"
@@ -609,16 +609,9 @@ async def show_admin_sub_manage(
     keyboard.append(
         [
             InlineKeyboardButton(
-                "\U0001f5d1\ufe0f Удалить (обнулить)",
-                callback_data=f"admin_sub_delete_{sub_id}",
-            )
-        ]
-    )
-    keyboard.append(
-        [
-            InlineKeyboardButton(
                 "\U0001f519 Назад",
-                callback_data=f"admin_user_subs_{sub['user_id']}",
+                callback_data=context.user_data.get("sub_back")
+                or f"admin_user_subs_{sub['user_id']}",
             )
         ]
     )
@@ -1586,4 +1579,6 @@ async def admin_sub_edit_handler(
         )
         return
 
+    # Возврат из подменю «Изменить абонемент» — в карточку клиента
+    context.user_data["sub_back"] = f"admin_user_manage_{user_id}"
     await show_admin_sub_manage(update, context, sub["id"])
