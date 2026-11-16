@@ -882,7 +882,16 @@ async def handle_freeze_quick(update: Update, context: ContextTypes.DEFAULT_TYPE
         await notify_admin(context, admin_msg, reply_markup=admin_keyboard)
         logger.info("Клиент %s запросил быструю заморозку %s", user["id"], freeze_id)
         await query.edit_message_text(
-            "\u2705 Заявка на быструю заморозку отправлена. Ждите подтверждения."
+            "\u2705 Заявка на быструю заморозку отправлена. Ждите подтверждения.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "\U0001f519 К абонементу", callback_data="my_subscription"
+                        )
+                    ]
+                ]
+            ),
         )
 
 
@@ -1095,7 +1104,16 @@ async def freeze_custom_end_date(update: Update, context: ContextTypes.DEFAULT_T
         await notify_admin(context, admin_msg, reply_markup=admin_keyboard)
         logger.info("Клиент %s запросил кастомную заморозку %s", client_user_id, freeze_id)
         await update.message.reply_text(
-            "\u2705 Заявка на заморозку отправлена. Ждите подтверждения."
+            "\u2705 Заявка на заморозку отправлена. Ждите подтверждения.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "\U0001f519 К абонементу", callback_data="my_subscription"
+                        )
+                    ]
+                ]
+            ),
         )
 
     return ConversationHandler.END

@@ -1062,12 +1062,7 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         keyboard = [
             [
                 InlineKeyboardButton(
-                    "\U0001f3e2 Купить в студии", callback_data="sub_buy_offline"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "\U0001f6d2 Купить онлайн (ЕРИП)", callback_data="sub_buy_online"
+                    "\U0001f6d2 Купить абонемент", callback_data="sub_buy_menu"
                 )
             ],
             [InlineKeyboardButton("\U0001f4d6 Правила пользования", url=RULES_URL)],
@@ -1140,14 +1135,7 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard.append(
         [
             InlineKeyboardButton(
-                "\U0001f3e2 Купить на занятии", callback_data="sub_buy_offline"
-            )
-        ]
-    )
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                "\U0001f6d2 Продлить онлайн (ЕРИП)", callback_data="sub_buy_online"
+                "\U0001f6d2 Купить абонемент", callback_data="sub_buy_menu"
             )
         ]
     )
@@ -1178,8 +1166,10 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
     await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
 
-async def show_subscription_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Объединённая история: покупки, заморозки, посещения (последние 20)."""
+async def show_subscription_history(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1
+):
+    """Объединённая история: покупки, заморозки, посещения (с пагинацией)."""
     query = update.callback_query
     await safe_answer(query)
 
@@ -1189,13 +1179,19 @@ async def show_subscription_history(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("Ошибка загрузки. Нажмите /start.")
         return
 
-    items = User.get_history(user["id"], limit=20)
+    items = User.get_history(user["id"], limit=500)
+
+    # Пагинация по 20 записей
+    HISTORY_PER_PAGE = 20
+    total_pages = max(1, math.ceil(len(items) / HISTORY_PER_PAGE))
+    page = max(1, min(page, total_pages))
+    page_items = items[(page - 1) * HISTORY_PER_PAGE : page * HISTORY_PER_PAGE]
 
     if not items:
         text = "\U0001f4c5 История\n\nПока нет записей."
     else:
-        lines = ["\U0001f4c5 История (последние 20)", ""]
-        for item in items:
+        lines = [f"\U0001f4c5 История (стр. {page} из {total_pages})", ""]
+        for item in page_items:
             date_str = _format_date(item.get("date"))
             item_type = item.get("type")
 
@@ -1268,10 +1264,27 @@ async def show_subscription_history(update: Update, context: ContextTypes.DEFAUL
                 lines.append(f"{icon} {line}")
         text = "\n".join(lines)
 
-    keyboard = [
+    keyboard = []
+    # Пагинация
+    nav = []
+    if page > 1:
+        nav.append(
+            InlineKeyboardButton(
+                "\u2b05\ufe0f", callback_data=f"sub_history_page_{page - 1}"
+            )
+        )
+    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(
+            InlineKeyboardButton(
+                "\u27a1\ufe0f", callback_data=f"sub_history_page_{page + 1}"
+            )
+        )
+    keyboard.append(nav)
+    keyboard.append(
         [InlineKeyboardButton("\U0001f519 Назад", callback_data="my_subscription")]
-    ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    )
+    await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
 
 
 async def show_sub_freeze_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1302,6 +1315,42 @@ async def show_sub_freeze_cancel(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton("\U0001f519 В меню", callback_data="my_subscription")]
     ]
     await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
+
+
+async def show_sub_buy_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подменю «Купить абонемент»: способы покупки."""
+    query = update.callback_query
+    await safe_answer(query)
+
+    text = "\U0001f6d2 Купить абонемент\n\nВыберите способ покупки:"
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\U0001f3e2 Заявка на покупку в студии", callback_data="sub_buy_offline"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f4b3 Оплатить онлайн", callback_data="sub_buy_online_stub"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "\U0001f4f1 Покупка по ЕРИП", callback_data="sub_buy_online"
+            )
+        ],
+        [InlineKeyboardButton("\U0001f4d6 Правила пользования", url=RULES_URL)],
+        [InlineKeyboardButton("\U0001f519 В меню", callback_data="my_subscription")],
+    ]
+    await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
+
+
+async def show_sub_buy_online_stub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Оплата онлайн — заглушка (интеграция позже)."""
+    query = update.callback_query
+    await safe_answer(
+        query, "Оплата онлайн скоро будет доступна", show_alert=True
+    )
 
 
 async def show_sub_buy_offline(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1360,10 +1409,10 @@ async def show_sub_buy_online(update: Update, context: ContextTypes.DEFAULT_TYPE
     keyboard = [
         [
             InlineKeyboardButton(
-                "\U0001f3e2 Купить в студии", callback_data="sub_buy_offline"
+                "\U0001f3e2 Заявка в студии", callback_data="sub_buy_offline"
             )
         ],
-        [InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")],
+        [InlineKeyboardButton("\U0001f519 В меню", callback_data="sub_buy_menu")],
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -2124,6 +2173,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_subscription_history(update, context)
         return
 
+    if data.startswith("sub_history_page_"):
+        try:
+            page = int(data[len("sub_history_page_"):])
+            await show_subscription_history(update, context, page)
+            return
+        except ValueError:
+            pass
+
     # Клиент: быстрая заморозка (без sub_id — берём активный абонемент)
     if data == "freeze_quick":
         await handle_freeze_quick(update, context)
@@ -2148,6 +2205,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # --- Остальные пункты ---
+    if data == "sub_buy_menu":
+        await show_sub_buy_menu(update, context)
+        return
+
+    if data == "sub_buy_online_stub":
+        await show_sub_buy_online_stub(update, context)
+        return
+
     if data == "sub_buy_offline":
         await show_sub_buy_offline(update, context)
         return
