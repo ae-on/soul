@@ -6,6 +6,7 @@ import math
 from datetime import date, datetime
 from typing import Optional
 
+from pymysql.cursors import DictCursor
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
@@ -37,54 +38,139 @@ def _format_weekdays(weekdays: str) -> str:
     )
 
 
+def _slot_location_icon(location_id) -> str:
+    """Иконка зала: 🏠 для Зал 1, 🏡 для Зал 2, иначе 🏢."""
+    if location_id == 1:
+        return "\U0001f3e0"
+    if location_id == 2:
+        return "\U0001f3e1"
+    return "\U0001f3e2"
+
+
+def _slot_sort_key(slot: dict):
+    """Сортировка: первый день недели (Пн=1), затем time_start, затем name."""
+    days = [int(d) for d in (slot.get("weekdays") or "").split(",") if d.strip()]
+    first_day = min(days) if days else 99
+    return (
+        first_day,
+        str(slot.get("time_start") or ""),
+        (slot.get("name") or "").lower(),
+    )
+
+
+def _slot_button_label(slot: dict) -> str:
+    """
+    Кнопка слота: «🏠 Пн/Ср 18:00 Бачата Иван».
+    В конце — неразрывные пробелы (\u00A0) для имитации левого края.
+    Это костыль: Telegram центрирует текст кнопок, другого способа нет.
+    """
+    # location_id может приходить строкой — приводим к int
+    raw_loc = slot.get("location_id")
+    try:
+        location_id = int(raw_loc) if raw_loc is not None else None
+    except (ValueError, TypeError):
+        location_id = None
+    icon = _slot_location_icon(location_id)
+
+    days_str = _format_weekdays(slot.get("weekdays"))
+    time_str = _format_time(slot.get("time_start"))
+    name = slot.get("name") or slot.get("category_slug") or "—"
+    name = name if len(name) <= 10 else name[:9] + "…"
+    teacher_name = slot.get("teacher_name") or ""
+    if teacher_name:
+        surname = teacher_name.split()[0]
+        teacher = surname if len(surname) <= 5 else surname[:5]
+    else:
+        teacher = "---"
+    pad = "\u00A0" * 8
+    return f"{icon} {days_str} {time_str} {name} {teacher}{pad}"
+
+
+def _slot_future_events_count(slot: dict) -> int:
+    """Количество будущих событий в events_cache, соответствующих слоту."""
+    with get_connection() as conn:
+        with conn.cursor(DictCursor) as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS cnt FROM events_cache e
+                   WHERE e.start_date >= CURDATE()
+                     AND e.start_time = %s
+                     AND FIND_IN_SET(WEEKDAY(e.start_date) + 1, %s) > 0
+                     AND COALESCE(e.location_id, 0) = COALESCE(%s, 0)
+                     AND COALESCE(e.category_slug, '') = %s""",
+                (
+                    str(slot.get("time_start") or ""),
+                    slot.get("weekdays") or "",
+                    slot.get("location_id"),
+                    slot.get("category_slug") or "",
+                ),
+            )
+            row = cur.fetchone()
+            return row["cnt"] if row else 0
+
+
+def _slot_future_bookings_count(slot: dict) -> int:
+    """Количество активных записей на будущие события, соответствующих слоту."""
+    with get_connection() as conn:
+        with conn.cursor(DictCursor) as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS cnt FROM bookings b
+                   JOIN events_cache e ON e.em_event_id = b.em_event_id
+                   WHERE e.start_date >= CURDATE()
+                     AND e.start_time = %s
+                     AND FIND_IN_SET(WEEKDAY(e.start_date) + 1, %s) > 0
+                     AND COALESCE(e.location_id, 0) = COALESCE(%s, 0)
+                     AND COALESCE(e.category_slug, '') = %s
+                     AND b.status IN ('registered', 'pending', 'confirmed')""",
+                (
+                    str(slot.get("time_start") or ""),
+                    slot.get("weekdays") or "",
+                    slot.get("location_id"),
+                    slot.get("category_slug") or "",
+                ),
+            )
+            row = cur.fetchone()
+            return row["cnt"] if row else 0
+
+
 # ----------------------------------------------------------------------
-# Список слотов
+# Список слотов (Расписание занятий)
 # ----------------------------------------------------------------------
 async def show_admin_slots(
     update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1
 ):
-    """Список всех слотов с пагинацией и кнопкой автосбора."""
+    """Список слотов кнопками, отсортированных по weekdays/time_start/name."""
     admin = await _require_admin(update, context)
     if not admin:
         return
-    query = update.callback_query
 
-    total = Group.count_all()
-    total_pages = max(1, math.ceil(total / SLOTS_PER_PAGE))
-    if page < 1:
-        page = 1
-    if page > total_pages:
-        page = total_pages
-
-    offset = (page - 1) * SLOTS_PER_PAGE
-    slots = Group.get_all_with_teachers(limit=SLOTS_PER_PAGE, offset=offset)
+    # Все слоты с преподавателями, сортировка в Python
+    # (get_all_with_teachers возвращает кортеж — используем sorted, а не .sort)
+    slots = sorted(Group.get_all_with_teachers(limit=1000, offset=0), key=_slot_sort_key)
 
     if not slots:
-        text = "\U0001f4c5 Слоты и группы\n\nНет слотов."
+        text = (
+            "\U0001f4c5 Расписание пусто. Нажмите «Собрать слоты», "
+            "чтобы загрузить данные с сайта."
+        )
         keyboard = [
-            [InlineKeyboardButton("\U0001f504 Собрать слоты из расписания", callback_data="admin_slots_sync")],
-            [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")],
+            [InlineKeyboardButton("\U0001f504 Собрать слоты", callback_data="admin_slots_sync")],
+            [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_panel")],
         ]
-        if query:
-            await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
-        else:
-            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
         return
 
-    lines = [f"\U0001f4c5 Слоты и группы (Всего: {total})", ""]
+    total = len(slots)
+    total_pages = max(1, math.ceil(total / SLOTS_PER_PAGE))
+    page = max(1, min(page, total_pages))
+    page_slots = slots[(page - 1) * SLOTS_PER_PAGE : page * SLOTS_PER_PAGE]
+
+    text = f"\U0001f4c5 Расписание занятий (Всего: {total})"
     keyboard = []
-    for slot in slots:
-        name = slot.get("name") or slot.get("category_slug") or "Слот"
-        days_str = _format_weekdays(slot.get("weekdays"))
-        time_str = _format_time(slot.get("time_start"))
-        teacher_name = slot.get("teacher_name") or "Не назначен"
-        # Формат: «Бачата Пн/Ср 18:00 (Иванов)»
-        label = f"{name} {days_str} {time_str} ({teacher_name})"
-        lines.append(f"• {label}")
+    for slot in page_slots:
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    f"\U0001f4c5 {label}",
+                    _slot_button_label(slot),
                     callback_data=f"admin_slot_manage_{slot['id']}",
                 )
             ]
@@ -99,23 +185,16 @@ async def show_admin_slots(
             nav.append(InlineKeyboardButton("\u27a1\ufe0f", callback_data=f"admin_slots_page_{page + 1}"))
         keyboard.append(nav)
 
-        page_buttons = []
-        for p in range(1, total_pages + 1):
-            label = f"[{p}]" if p == page else str(p)
-            page_buttons.append(InlineKeyboardButton(label, callback_data=f"admin_slots_page_{p}"))
-        for i in range(0, len(page_buttons), 5):
-            keyboard.append(page_buttons[i : i + 5])
-
     keyboard.append(
-        [InlineKeyboardButton("\U0001f504 Собрать слоты из расписания", callback_data="admin_slots_sync")]
+        [
+            InlineKeyboardButton("\U0001f504 Собрать слоты", callback_data="admin_slots_sync"),
+            InlineKeyboardButton("\U0001f5d1\ufe0f Удалить слоты", callback_data="admin_slots_delete_menu"),
+        ]
     )
     keyboard.append(
         [InlineKeyboardButton("\U0001f519 В админ-панель", callback_data="admin_panel")]
     )
-    if query:
-        await _safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(keyboard))
-    else:
-        await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
+    await _safe_edit(update, text, InlineKeyboardMarkup(keyboard))
 
 
 # ----------------------------------------------------------------------
@@ -132,7 +211,13 @@ def _event_weekday(start_date) -> str:
 
 
 async def handle_admin_slots_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Автоматически создаёт слоты на основе событий в events_cache."""
+    """Автосбор слотов из events_cache.
+
+    Ключ сопоставления: f"{category_slug}_{time_start}_{time_end}_{location_id}_{weekday}".
+    Каждый слот соответствует одному дню недели (weekdays = "N").
+    У существующего слота обновляется только name; teacher_id не трогаем.
+    Активные слоты без будущих событий переводятся в архив (active=0).
+    """
     admin = await _require_admin(update, context)
     if not admin:
         return
@@ -153,61 +238,220 @@ async def handle_admin_slots_sync(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    # Уникальные группы (name, start_time, end_time) + дата для дня недели
+    # События: самое свежее первым (для выбора актуального name)
     with get_connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(DictCursor) as cur:
             cur.execute(
-                """SELECT DISTINCT name, start_time, end_time, start_date
+                """SELECT name, start_time, end_time, start_date,
+                          location_id, category_slug, teacher_id
                    FROM events_cache
                    WHERE name IS NOT NULL AND name != ''
-                   ORDER BY name, start_time"""
+                   ORDER BY start_date DESC, start_time"""
             )
             rows = cur.fetchall()
 
-    # Группируем по (name, time_start, time_end), собирая дни недели
-    groups: dict[tuple[str, str, str], set[str]] = {}
+    # Группируем по (name, time_start, time_end, location_id), собирая дни недели
+    groups: dict[tuple, dict] = {}
     for r in rows:
-        key = (r[0], str(r[1]), str(r[2]) if r[2] else "")
-        wd = _event_weekday(r[3])
-        if wd:
-            groups.setdefault(key, set()).add(wd)
+        weekday = _event_weekday(r["start_date"])
+        if not weekday:
+            continue
+        key = (
+            r["name"],
+            str(r["start_time"]),
+            str(r["end_time"]) if r["end_time"] else "",
+            r["location_id"],
+        )
+        g = groups.setdefault(
+            key,
+            {"days": set(), "category_slug": r["category_slug"] or "dance", "teacher_id": None},
+        )
+        g["days"].add(int(weekday))
+        if not g["teacher_id"] and r["teacher_id"]:
+            g["teacher_id"] = r["teacher_id"]
 
     created = 0
-    for (name, time_start, time_end), days in groups.items():
-        weekdays = ",".join(sorted(days, key=int))
-        # Проверяем, есть ли уже такой слот
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id FROM slots WHERE name = %s AND time_start = %s LIMIT 1",
-                    (name, time_start),
-                )
-                if cur.fetchone():
-                    continue  # уже есть
+    updated = 0
+    for (name, time_start, time_end, location_id), g in groups.items():
+        weekdays = ",".join(str(d) for d in sorted(g["days"]))
+        category_slug = g["category_slug"]
+        teacher_id = g["teacher_id"]
 
+        # Ищем слот с таким же ключом (name, time_start, time_end, location_id)
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT id, teacher_id FROM slots
+                       WHERE name = %s AND time_start = %s
+                         AND COALESCE(time_end, '') = %s
+                         AND COALESCE(location_id, 0) = %s
+                       LIMIT 1""",
+                    (name, time_start, time_end, location_id or 0),
+                )
+                existing = cur.fetchone()
+
+        if existing:
+            # Обновляем name и weekdays; teacher_id — только если у слота его нет
+            updates = {"name": name, "weekdays": weekdays}
+            if not existing.get("teacher_id") and teacher_id:
+                updates["teacher_id"] = teacher_id
+            try:
+                Group.update(existing["id"], **updates)
+                updated += 1
+            except Exception as e:
+                logger.error("Ошибка при обновлении слота %s: %s", existing["id"], e)
+            continue
+
+        # Создаём новый слот (weekdays = "1,3")
         try:
-            # category_slug — первое слово названия в нижнем регистре
-            first_word = name.split()[0] if name.split() else "dance"
-            category_slug = first_word.lower()[:50]
             Group.create_with_duration(
                 name=name,
                 category_slug=category_slug,
                 weekdays=weekdays,
                 time_start=time_start,
                 time_end=time_end,
+                location_id=location_id,
+                teacher_id=teacher_id,
                 active=1,
             )
             created += 1
         except Exception as e:
             logger.error("Ошибка при создании слота %s: %s", name, e)
 
-    logger.info("Автосбор слотов: найдено событий %d, создано слотов %d", total, created)
+    # Архивация активных слотов без будущих событий
+    archived = 0
+    with get_connection() as conn:
+        with conn.cursor(DictCursor) as cur:
+            cur.execute("SELECT * FROM slots WHERE active = 1")
+            active_slots = cur.fetchall()
+    for slot in active_slots:
+        if _slot_future_events_count(slot) == 0:
+            Group.update(slot["id"], active=0)
+            archived += 1
+
+    logger.info(
+        "Автосбор слотов: событий %d, создано %d, обновлено %d, в архив %d",
+        total, created, updated, archived,
+    )
     await safe_answer(
         query,
-        f"Найдено событий: {total}, создано слотов: {created}",
+        f"Событий: {total}. Создано: {created}, обновлено: {updated}, в архив: {archived}",
         show_alert=True,
     )
     await show_admin_slots(update, context)
+
+
+# ----------------------------------------------------------------------
+# Удаление слотов и архива
+# ----------------------------------------------------------------------
+async def show_admin_slots_delete_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Меню удаления: архивные слоты + очистка пустых."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    with get_connection() as conn:
+        with conn.cursor(DictCursor) as cur:
+            cur.execute("SELECT * FROM slots WHERE active = 0 ORDER BY name")
+            archived = cur.fetchall()
+
+    if not archived:
+        text = "\U0001f5d1\ufe0f Удаление слотов\n\nВ архиве нет слотов."
+    else:
+        lines = [f"\U0001f5d1\ufe0f Удаление слотов (в архиве: {len(archived)})", ""]
+        for slot in archived:
+            label = (
+                f"{slot.get('name') or slot.get('category_slug') or '—'} "
+                f"{_format_weekdays(slot.get('weekdays'))} "
+                f"{_format_time(slot.get('time_start'))}"
+            )
+            lines.append(f"• {label}")
+        text = "\n".join(lines)
+
+    keyboard = []
+    for slot in archived:
+        label = (
+            f"{slot.get('name') or slot.get('category_slug') or '—'} "
+            f"{_format_weekdays(slot.get('weekdays'))} "
+            f"{_format_time(slot.get('time_start'))}"
+        )
+        keyboard.append(
+            [InlineKeyboardButton(label, callback_data=f"admin_slot_delete_do_{slot['id']}")]
+        )
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f9f9 Очистить без привязок", callback_data="admin_slots_clear_empty")]
+    )
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data="admin_slots")]
+    )
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+
+async def handle_admin_slots_clear_empty(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Удалить слоты без преподавателя и без записей на будущие события."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    with get_connection() as conn:
+        with conn.cursor(DictCursor) as cur:
+            cur.execute("SELECT * FROM slots WHERE teacher_id IS NULL")
+            candidates = cur.fetchall()
+
+    deleted = 0
+    for slot in candidates:
+        if _slot_future_bookings_count(slot) == 0:
+            try:
+                Group.delete(slot["id"])
+                deleted += 1
+            except Exception as e:
+                logger.error("Ошибка при удалении слота %s: %s", slot["id"], e)
+
+    logger.info("Админ %s очистил слоты без привязок: %s", admin["id"], deleted)
+    await safe_answer(query, f"Удалено слотов: {deleted}", show_alert=True)
+    await show_admin_slots_delete_menu(update, context)
+
+
+async def handle_admin_slot_delete_do(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, slot_id: int
+):
+    """Удалить архивный слот, если нет записей на будущие события."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    slot = Group.get_by_id(slot_id)
+    if not slot:
+        await safe_answer(query, "Слот не найден", show_alert=True)
+        await show_admin_slots_delete_menu(update, context)
+        return
+
+    bookings = _slot_future_bookings_count(slot)
+    if bookings > 0:
+        await safe_answer(
+            query,
+            "Нельзя удалить: к слоту привязаны записи!",
+            show_alert=True,
+        )
+        await show_admin_slots_delete_menu(update, context)
+        return
+
+    try:
+        Group.delete(slot_id)
+        logger.info("Админ %s удалил слот %s", admin["id"], slot_id)
+        await safe_answer(query, "\U0001f5d1\ufe0f Слот удалён", show_alert=True)
+    except Exception as e:
+        logger.error("Ошибка при удалении слота %s: %s", slot_id, e)
+        await safe_answer(query, "Ошибка при удалении", show_alert=True)
+
+    await show_admin_slots_delete_menu(update, context)
 
 
 # ----------------------------------------------------------------------
@@ -252,15 +496,183 @@ async def show_admin_slot_manage(
                 callback_data=f"admin_slot_assign_{slot_id}",
             )
         ],
+    ]
+
+    # «Привязать данные» — только если слот пустой (нет будущих событий или преподавателя)
+    if _slot_future_events_count(slot) == 0 or not slot.get("teacher_id"):
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f517 Привязать данные",
+                    callback_data=f"admin_slot_link_{slot_id}",
+                )
+            ]
+        )
+
+    keyboard.append(
         [
             InlineKeyboardButton(
-                "\U0001f5d1\ufe0f Удалить слот",
+                "\U0001f5d1\ufe0f Удалить класс",
                 callback_data=f"admin_slot_delete_{slot_id}",
             )
+        ]
+    )
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 К списку слотов", callback_data="admin_slots")]
+    )
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+
+async def show_admin_slot_link(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, slot_id: int
+):
+    """Список слотов для переноса данных (слияние)."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    slot = Group.get_by_id(slot_id)
+    if not slot:
+        await safe_answer(query, "Слот не найден", show_alert=True)
+        return
+
+    # Другие слоты, отсортированные по name
+    others = [
+        s for s in Group.get_all_with_teachers(limit=1000, offset=0)
+        if s["id"] != slot_id
+    ]
+    others.sort(key=lambda s: (s.get("name") or "").lower())
+
+    text = (
+        f"\U0001f517 Привязать данные\n\n"
+        f"Слот: {slot.get('name') or slot.get('category_slug') or '—'}\n"
+        "Выберите слот, на который перенести преподавателя:"
+    )
+    keyboard = []
+    for s in others:
+        label = s.get("name") or s.get("category_slug") or f"Слот #{s['id']}"
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"{label} | {_format_weekdays(s.get('weekdays'))} | {_format_time(s.get('time_start'))}",
+                    callback_data=f"admin_slot_link_do_{s['id']}_{slot_id}",
+                )
+            ]
+        )
+    keyboard.append(
+        [InlineKeyboardButton("\U0001f519 Назад", callback_data=f"admin_slot_manage_{slot_id}")]
+    )
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+
+async def handle_admin_slot_link_do(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    new_slot_id: int,
+    old_slot_id: int,
+):
+    """Перенос данных со старого слота на новый, старый — в архив."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    old_slot = Group.get_by_id(old_slot_id)
+    new_slot = Group.get_by_id(new_slot_id)
+    if not old_slot or not new_slot:
+        await safe_answer(query, "Слот не найден", show_alert=True)
+        return
+
+    # Переносим привязки со старого на новый, не затирая данные нового
+    updates = {}
+    if not new_slot.get("teacher_id") and old_slot.get("teacher_id"):
+        updates["teacher_id"] = old_slot["teacher_id"]
+    if not new_slot.get("location_id") and old_slot.get("location_id"):
+        updates["location_id"] = old_slot["location_id"]
+
+    try:
+        if updates:
+            Group.update(new_slot_id, **updates)
+        # Старый слот — в архив
+        Group.update(old_slot_id, active=0)
+        logger.info(
+            "Админ %s связал слот %s -> %s (перенесено: %s), старый в архив",
+            admin["id"], old_slot_id, new_slot_id, list(updates.keys()),
+        )
+        await safe_answer(
+            query, "\u2705 Данные перенесены, старый слот в архиве", show_alert=True
+        )
+    except Exception as e:
+        logger.error(
+            "Ошибка при связывании слотов %s -> %s: %s",
+            old_slot_id, new_slot_id, e, exc_info=True,
+        )
+        await safe_answer(query, "Ошибка при связывании", show_alert=True)
+
+    await show_admin_slots(update, context)
+
+
+async def handle_admin_slot_delete(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, slot_id: int
+):
+    """Удаление класса: проверка привязок и подтверждение."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    slot = Group.get_by_id(slot_id)
+    if not slot:
+        await safe_answer(query, "Слот не найден", show_alert=True)
+        return
+
+    bookings = _slot_future_bookings_count(slot)
+    if bookings > 0:
+        await safe_answer(
+            query,
+            "Нельзя удалить: к слоту привязаны записи! Сначала отправьте в архив.",
+            show_alert=True,
+        )
+        return
+
+    text = (
+        "\U0001f5d1\ufe0f Удалить класс?\n\n"
+        "Вы уверены? Это действие необратимо."
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "\u2705 Да, удалить", callback_data=f"admin_slot_delete_yes_{slot_id}"
+            )
         ],
-        [InlineKeyboardButton("\U0001f519 К списку слотов", callback_data="admin_slots")],
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Нет", callback_data=f"admin_slot_manage_{slot_id}"
+            )
+        ],
     ]
     await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+
+async def handle_admin_slot_delete_yes(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, slot_id: int
+):
+    """Фактическое удаление слота из БД."""
+    admin = await _require_admin(update, context)
+    if not admin:
+        return
+    query = update.callback_query
+
+    try:
+        Group.delete(slot_id)
+        logger.info("Админ %s удалил слот %s", admin["id"], slot_id)
+        await safe_answer(query, "\U0001f5d1\ufe0f Слот удалён", show_alert=True)
+    except Exception as e:
+        logger.error("Ошибка при удалении слота %s: %s", slot_id, e)
+        await safe_answer(query, "Ошибка при удалении", show_alert=True)
+
+    await show_admin_slots(update, context)
 
 
 async def show_admin_slot_assign(
@@ -352,23 +764,3 @@ async def handle_admin_slot_set_teacher(
         await safe_answer(query, "Ошибка при назначении", show_alert=True)
 
     await show_admin_slot_manage(update, context, slot_id)
-
-
-async def handle_admin_slot_delete(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, slot_id: int
-):
-    """Удалить слот."""
-    admin = await _require_admin(update, context)
-    if not admin:
-        return
-    query = update.callback_query
-
-    try:
-        Group.delete(slot_id)
-        logger.info("Админ %s удалил слот %s", admin["id"], slot_id)
-        await safe_answer(query, "\U0001f5d1\ufe0f Слот удалён", show_alert=True)
-    except Exception as e:
-        logger.error("Ошибка при удалении слота %s: %s", slot_id, e)
-        await safe_answer(query, "Ошибка при удалении", show_alert=True)
-
-    await show_admin_slots(update, context)

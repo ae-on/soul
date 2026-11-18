@@ -63,9 +63,15 @@ from handlers.admin import (
 )
 from handlers.admin_slots import (
     handle_admin_slot_delete,
+    handle_admin_slot_delete_do,
+    handle_admin_slot_delete_yes,
+    handle_admin_slot_link_do,
+    handle_admin_slots_clear_empty,
     handle_admin_slots_sync,
     handle_admin_slot_set_teacher,
     show_admin_slot_assign,
+    show_admin_slots_delete_menu,
+    show_admin_slot_link,
     show_admin_slot_manage,
     show_admin_slots,
 )
@@ -284,15 +290,31 @@ async def sync_events_cache() -> int:
         if not start_date:
             continue
 
+        # Recurring Events: если есть массив дат — создаём запись на каждую дату
+        recurrence = ev.get("recurrence") or {}
+        dates = recurrence.get("dates") if isinstance(recurrence, dict) else None
+        date_list = [d for d in dates if d] if dates else [start_date]
+
         # Владелец события из EM (API может не отдавать email — тогда ищем по имени)
         owner_email = None
         owner_name = None
         owner = ev.get("owner") or {}
         if isinstance(owner, dict):
-            owner_email = owner.get("email")
-            owner_name = owner.get("name")
+            owner_email = (owner.get("email") or "").strip() or None
+            owner_name = owner.get("name") or owner.get("display_name")
         elif isinstance(owner, str) and owner:
-            owner_name = owner
+            owner = owner.strip()
+            if "@" in owner:
+                owner_email = owner
+            else:
+                owner_name = owner
+        # Страховка: email может лежать в других полях события
+        if not owner_email:
+            for k in ("contact_email", "event_owner_email", "user_email"):
+                val = ev.get(k)
+                if isinstance(val, str) and "@" in val:
+                    owner_email = val.strip()
+                    break
 
         # Находим преподавателя: сначала по email, затем по имени
         teacher_id = None
@@ -301,22 +323,23 @@ async def sync_events_cache() -> int:
         if not teacher_id:
             logger.info("Не найден преподаватель для события %s (email=%s, name=%s)", em_id, owner_email, owner_name)
 
-        # Upsert в кэш
-        try:
-            EventCache.upsert(
-                em_event_id=em_id,
-                name=name,
-                start_date=start_date,
-                start_time=start_time,
-                end_time=end_time,
-                location_id=location_id,
-                location_name=location_name,
-                category_slug=category_slug,
-                teacher_id=teacher_id,
-            )
-            count += 1
-        except Exception as e:
-            logger.error("Ошибка при сохранении события %s: %s", em_id, e)
+        # Upsert в кэш — по одной записи на каждую дату
+        for d in date_list:
+            try:
+                EventCache.upsert(
+                    em_event_id=em_id,
+                    name=name,
+                    start_date=d,
+                    start_time=start_time,
+                    end_time=end_time,
+                    location_id=location_id,
+                    location_name=location_name,
+                    category_slug=category_slug,
+                    teacher_id=teacher_id,
+                )
+                count += 1
+            except Exception as e:
+                logger.error("Ошибка при сохранении события %s: %s", em_id, e)
 
     logger.info("Скачано %d событий, сохранено %d", len(events), count)
     return count
@@ -2300,6 +2323,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_admin_slots_sync(update, context)
         return
 
+    if data == "admin_slots_delete_menu":
+        await show_admin_slots_delete_menu(update, context)
+        return
+
+    if data == "admin_slots_clear_empty":
+        await handle_admin_slots_clear_empty(update, context)
+        return
+
+    if data.startswith("admin_slot_delete_do_"):
+        sid = _extract_int(data, "admin_slot_delete_do_")
+        if sid is not None:
+            await handle_admin_slot_delete_do(update, context, sid)
+            return
+
     if data == "admin_types":
         await show_admin_types(update, context)
         return
@@ -2327,6 +2364,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_type_add":
         await admin_type_add_start(update, context)
         return
+
+    if data.startswith("admin_slot_link_do_"):
+        # admin_slot_link_do_{new_slot_id}_{old_slot_id}
+        parsed = _extract_two_ints(data, "admin_slot_link_do_")
+        if parsed:
+            new_sid, old_sid = parsed
+            await handle_admin_slot_link_do(update, context, new_sid, old_sid)
+            return
+
+    if data.startswith("admin_slot_link_"):
+        sid = _extract_int(data, "admin_slot_link_")
+        if sid is not None:
+            await show_admin_slot_link(update, context, sid)
+            return
+
+    if data.startswith("admin_slot_delete_yes_"):
+        sid = _extract_int(data, "admin_slot_delete_yes_")
+        if sid is not None:
+            await handle_admin_slot_delete_yes(update, context, sid)
+            return
 
     if data.startswith("admin_slot_delete_"):
         sid = _extract_int(data, "admin_slot_delete_")

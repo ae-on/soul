@@ -430,28 +430,34 @@ class User(BaseModel):
     @classmethod
     def find_teacher_id(cls, email: str = None, name: str = None) -> Optional[int]:
         """
-        Находит ID пользователя по email (точно) или по full_name
-        (LIKE, первое совпадение). Возвращает None, если не найден.
+        Находит ID пользователя по email (точно) или по full_name.
+        При поиске по имени порядок слов не важен: «Ирина Касач» найдёт
+        пользователя «Касач Ирина» (все слова должны присутствовать).
+        Возвращает None, если не найден.
         """
         with get_connection() as conn:
             with conn.cursor(DictCursor) as cur:
                 if email:
-                    cur.execute(
-                        "SELECT id FROM users WHERE email = %s LIMIT 1", (email,)
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        return row["id"]
+                    email = email.strip()
+                    if email:
+                        cur.execute(
+                            "SELECT id FROM users WHERE email = %s LIMIT 1", (email,)
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            return row["id"]
                 if name:
-                    cur.execute(
-                        """SELECT id FROM users
-                           WHERE full_name LIKE %s
-                           LIMIT 1""",
-                        (f"%{name}%",),
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        return row["id"]
+                    words = [w for w in name.split() if w]
+                    if words:
+                        conditions = " AND ".join(["full_name LIKE %s"] * len(words))
+                        values = tuple(f"%{w}%" for w in words)
+                        cur.execute(
+                            f"SELECT id FROM users WHERE {conditions} LIMIT 1",
+                            values,
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            return row["id"]
                 return None
 
     @classmethod
