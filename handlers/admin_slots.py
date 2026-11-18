@@ -87,47 +87,79 @@ def _slot_button_label(slot: dict) -> str:
 
 
 def _slot_future_events_count(slot: dict) -> int:
-    """Количество будущих событий в events_cache, соответствующих слоту."""
+    """Количество будущих событий в events_cache, соответствующих слоту.
+
+    Для слотов с recurrence_id — по набору повторений; для старых слотов
+    (без recurrence_id) — по времени/дням/залу/названию (категория мягко).
+    """
     with get_connection() as conn:
         with conn.cursor(DictCursor) as cur:
-            cur.execute(
-                """SELECT COUNT(*) AS cnt FROM events_cache e
-                   WHERE e.start_date >= CURDATE()
-                     AND e.start_time = %s
-                     AND FIND_IN_SET(WEEKDAY(e.start_date) + 1, %s) > 0
-                     AND COALESCE(e.location_id, 0) = COALESCE(%s, 0)
-                     AND COALESCE(e.category_slug, '') = %s""",
-                (
-                    str(slot.get("time_start") or ""),
-                    slot.get("weekdays") or "",
-                    slot.get("location_id"),
-                    slot.get("category_slug") or "",
-                ),
-            )
+            if slot.get("recurrence_id"):
+                cur.execute(
+                    """SELECT COUNT(*) AS cnt FROM events_cache e
+                       WHERE e.start_date >= CURDATE()
+                         AND e.recurrence_id = %s""",
+                    (slot["recurrence_id"],),
+                )
+            else:
+                cur.execute(
+                    """SELECT COUNT(*) AS cnt FROM events_cache e
+                       WHERE e.start_date >= CURDATE()
+                         AND e.start_time = %s
+                         AND FIND_IN_SET(WEEKDAY(e.start_date) + 1, %s) > 0
+                         AND COALESCE(e.location_id, 0) = COALESCE(%s, 0)
+                         AND (%s = '' OR e.category_slug = %s OR e.category_slug = '')
+                         AND e.name = %s""",
+                    (
+                        str(slot.get("time_start") or ""),
+                        slot.get("weekdays") or "",
+                        slot.get("location_id"),
+                        slot.get("category_slug") or "",
+                        slot.get("category_slug") or "",
+                        slot.get("name") or "",
+                    ),
+                )
             row = cur.fetchone()
             return row["cnt"] if row else 0
 
 
 def _slot_future_bookings_count(slot: dict) -> int:
-    """Количество активных записей на будущие события, соответствующих слоту."""
+    """Количество активных записей на будущие события, соответствующих слоту.
+
+    Для слотов с recurrence_id — по набору повторений; для старых слотов
+    (без recurrence_id) — по времени/дням/залу/названию (категория мягко).
+    """
     with get_connection() as conn:
         with conn.cursor(DictCursor) as cur:
-            cur.execute(
-                """SELECT COUNT(*) AS cnt FROM bookings b
-                   JOIN events_cache e ON e.em_event_id = b.em_event_id
-                   WHERE e.start_date >= CURDATE()
-                     AND e.start_time = %s
-                     AND FIND_IN_SET(WEEKDAY(e.start_date) + 1, %s) > 0
-                     AND COALESCE(e.location_id, 0) = COALESCE(%s, 0)
-                     AND COALESCE(e.category_slug, '') = %s
-                     AND b.status IN ('registered', 'pending', 'confirmed')""",
-                (
-                    str(slot.get("time_start") or ""),
-                    slot.get("weekdays") or "",
-                    slot.get("location_id"),
-                    slot.get("category_slug") or "",
-                ),
-            )
+            if slot.get("recurrence_id"):
+                cur.execute(
+                    """SELECT COUNT(*) AS cnt FROM bookings b
+                       JOIN events_cache e ON e.em_event_id = b.em_event_id
+                       WHERE e.start_date >= CURDATE()
+                         AND e.recurrence_id = %s
+                         AND b.status IN ('registered', 'pending', 'confirmed')""",
+                    (slot["recurrence_id"],),
+                )
+            else:
+                cur.execute(
+                    """SELECT COUNT(*) AS cnt FROM bookings b
+                       JOIN events_cache e ON e.em_event_id = b.em_event_id
+                       WHERE e.start_date >= CURDATE()
+                         AND e.start_time = %s
+                         AND FIND_IN_SET(WEEKDAY(e.start_date) + 1, %s) > 0
+                         AND COALESCE(e.location_id, 0) = COALESCE(%s, 0)
+                         AND (%s = '' OR e.category_slug = %s OR e.category_slug = '')
+                         AND e.name = %s
+                         AND b.status IN ('registered', 'pending', 'confirmed')""",
+                    (
+                        str(slot.get("time_start") or ""),
+                        slot.get("weekdays") or "",
+                        slot.get("location_id"),
+                        slot.get("category_slug") or "",
+                        slot.get("category_slug") or "",
+                        slot.get("name") or "",
+                    ),
+                )
             row = cur.fetchone()
             return row["cnt"] if row else 0
 
@@ -238,33 +270,48 @@ async def handle_admin_slots_sync(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    # События: самое свежее первым (для выбора актуального name)
+    # Только будущие события (старые даты со старым названием не должны
+    # плодить дубликаты при смене имени мероприятия)
     with get_connection() as conn:
         with conn.cursor(DictCursor) as cur:
             cur.execute(
                 """SELECT name, start_time, end_time, start_date,
-                          location_id, category_slug, teacher_id
+                          location_id, category_slug, teacher_id, recurrence_id
                    FROM events_cache
                    WHERE name IS NOT NULL AND name != ''
+                     AND start_date >= CURDATE()
                    ORDER BY start_date DESC, start_time"""
             )
             rows = cur.fetchall()
 
-    # Группируем по (name, time_start, time_end, location_id), собирая дни недели
+    # Группируем по набору повторений (recurrence_id), чтобы классы с одинаковым
+    # названием/временем, но разными днями (Вт/Чт и Сб) не склеивались в один слот.
+    # Для разовых событий (без recurrence_id) — по (name, time, location, weekday).
     groups: dict[tuple, dict] = {}
     for r in rows:
         weekday = _event_weekday(r["start_date"])
         if not weekday:
             continue
-        key = (
-            r["name"],
-            str(r["start_time"]),
-            str(r["end_time"]) if r["end_time"] else "",
-            r["location_id"],
-        )
+        time_start = str(r["start_time"])
+        time_end = str(r["end_time"]) if r["end_time"] else ""
+        location_id = r["location_id"]
+        rec_id = r["recurrence_id"]
+        if rec_id:
+            key = ("rec", rec_id, time_start, time_end, location_id)
+        else:
+            key = ("single", r["name"], time_start, time_end, location_id, int(weekday))
         g = groups.setdefault(
             key,
-            {"days": set(), "category_slug": r["category_slug"] or "dance", "teacher_id": None},
+            {
+                "days": set(),
+                "name": r["name"],
+                "category_slug": r["category_slug"] or "dance",
+                "teacher_id": None,
+                "recurrence_id": rec_id,
+                "time_start": time_start,
+                "time_end": time_end,
+                "location_id": location_id,
+            },
         )
         g["days"].add(int(weekday))
         if not g["teacher_id"] and r["teacher_id"]:
@@ -272,27 +319,48 @@ async def handle_admin_slots_sync(update: Update, context: ContextTypes.DEFAULT_
 
     created = 0
     updated = 0
-    for (name, time_start, time_end, location_id), g in groups.items():
+    # Сначала группы с recurrence_id (повторяющиеся классы), затем разовые —
+    # чтобы устаревшие записи кэша без recurrence_id не создавали дубликаты
+    for key, g in sorted(groups.items(), key=lambda kv: (kv[1]["recurrence_id"] is None, kv[0])):
         weekdays = ",".join(str(d) for d in sorted(g["days"]))
+        name = g["name"]
         category_slug = g["category_slug"]
         teacher_id = g["teacher_id"]
+        time_start = g["time_start"]
+        time_end = g["time_end"]
+        location_id = g["location_id"]
 
-        # Ищем слот с таким же ключом (name, time_start, time_end, location_id)
-        with get_connection() as conn:
-            with conn.cursor(DictCursor) as cur:
-                cur.execute(
-                    """SELECT id, teacher_id FROM slots
-                       WHERE name = %s AND time_start = %s
-                         AND COALESCE(time_end, '') = %s
-                         AND COALESCE(location_id, 0) = %s
-                       LIMIT 1""",
-                    (name, time_start, time_end, location_id or 0),
-                )
-                existing = cur.fetchone()
+        # Ищем существующий слот: сначала по recurrence_id (переименование),
+        # затем по (name, time_start, time_end, location_id, weekdays)
+        existing = None
+        if g["recurrence_id"]:
+            with get_connection() as conn:
+                with conn.cursor(DictCursor) as cur:
+                    cur.execute(
+                        "SELECT id, teacher_id FROM slots WHERE recurrence_id = %s LIMIT 1",
+                        (g["recurrence_id"],),
+                    )
+                    existing = cur.fetchone()
+        if not existing:
+            with get_connection() as conn:
+                with conn.cursor(DictCursor) as cur:
+                    cur.execute(
+                        """SELECT id, teacher_id FROM slots
+                           WHERE name = %s AND time_start = %s
+                             AND COALESCE(time_end, '') = %s
+                             AND COALESCE(location_id, 0) = %s
+                             AND weekdays = %s
+                           LIMIT 1""",
+                        (name, time_start, time_end, location_id or 0, weekdays),
+                    )
+                    existing = cur.fetchone()
 
         if existing:
-            # Обновляем name и weekdays; teacher_id — только если у слота его нет
-            updates = {"name": name, "weekdays": weekdays}
+            # Обновляем name и weekdays; слот с будущими событиями — активен;
+            # teacher_id — только если у слота его нет
+            updates = {"name": name, "weekdays": weekdays, "active": 1}
+            if g["recurrence_id"]:
+                updates["recurrence_id"] = g["recurrence_id"]
             if not existing.get("teacher_id") and teacher_id:
                 updates["teacher_id"] = teacher_id
             try:
@@ -302,7 +370,23 @@ async def handle_admin_slots_sync(update: Update, context: ContextTypes.DEFAULT_
                 logger.error("Ошибка при обновлении слота %s: %s", existing["id"], e)
             continue
 
-        # Создаём новый слот (weekdays = "1,3")
+        # Разовое событие без recurrence_id: не создаём дубль, если класс
+        # с таким же названием/временем/залом уже есть (устаревшая запись кэша)
+        if not g["recurrence_id"]:
+            with get_connection() as conn:
+                with conn.cursor(DictCursor) as cur:
+                    cur.execute(
+                        """SELECT id FROM slots
+                           WHERE name = %s AND time_start = %s
+                             AND COALESCE(time_end, '') = %s
+                             AND COALESCE(location_id, 0) = %s
+                           LIMIT 1""",
+                        (name, time_start, time_end, location_id or 0),
+                    )
+                    if cur.fetchone():
+                        continue
+
+        # Создаём новый слот (weekdays = "2,4")
         try:
             Group.create_with_duration(
                 name=name,
@@ -312,6 +396,7 @@ async def handle_admin_slots_sync(update: Update, context: ContextTypes.DEFAULT_
                 time_end=time_end,
                 location_id=location_id,
                 teacher_id=teacher_id,
+                recurrence_id=g["recurrence_id"],
                 active=1,
             )
             created += 1

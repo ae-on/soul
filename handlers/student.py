@@ -294,6 +294,11 @@ async def sync_events_cache() -> int:
         recurrence = ev.get("recurrence") or {}
         dates = recurrence.get("dates") if isinstance(recurrence, dict) else None
         date_list = [d for d in dates if d] if dates else [start_date]
+        # ID набора повторений (set_id) — ключ для группировки слотов,
+        # чтобы классы с одинаковым названием/временем, но разными днями не склеивались
+        recurrence_id = None
+        if isinstance(recurrence, dict):
+            recurrence_id = recurrence.get("set_id") or recurrence.get("event_id")
 
         # Владелец события из EM (API может не отдавать email — тогда ищем по имени)
         owner_email = None
@@ -336,6 +341,7 @@ async def sync_events_cache() -> int:
                     location_name=location_name,
                     category_slug=category_slug,
                     teacher_id=teacher_id,
+                    recurrence_id=recurrence_id,
                 )
                 count += 1
             except Exception as e:
