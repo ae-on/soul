@@ -52,6 +52,7 @@ from handlers.student import (
     ask_handler,
     text_handler,
     sync_events_cache,
+    send_reminders_24h,
 )
 from handlers.admin import (
     ADMIN_FREEZE_START,
@@ -369,6 +370,20 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
     )
     application.add_handler(CallbackQueryHandler(button_handler))
+
+    # Напоминания о занятиях за 24 часа — ежечасно (JobQueue)
+    if application.job_queue:
+        async def _reminders_24h_job(context):
+            await send_reminders_24h(context.bot)
+
+        application.job_queue.run_repeating(
+            _reminders_24h_job, interval=3600, first=60
+        )
+    else:
+        logger.warning(
+            "JobQueue недоступен (нет APScheduler) — напоминания за 24 часа отключены. "
+            "Установите: pip install 'python-telegram-bot[job-queue]'"
+        )
 
     # ВАЖНО ДЛЯ ДЕПЛОЯ: Перед запуском на VPS убедитесь, что выполнены все миграции!
     # Команда: python3 db/migrations/run_migration.py 001_add_user_roles.sql

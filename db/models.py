@@ -1290,7 +1290,26 @@ class Booking(BaseModel):
 
     @classmethod
     def get_by_user_and_event(cls, user_id: int, em_event_id: int) -> Optional[dict]:
-        """Найти запись конкретного пользователя на событие."""
+        """
+        Найти активную запись пользователя на событие.
+        Отменённые и прошедшие записи не блокируют повторную регистрацию.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT * FROM bookings
+                       WHERE user_id = %s AND em_event_id = %s
+                         AND status IN ('registered', 'pending', 'confirmed')
+                         AND (event_date IS NULL OR event_date >= CURDATE())""",
+                    (user_id, em_event_id),
+                )
+                return cur.fetchone()
+
+    @classmethod
+    def get_any_by_user_and_event(
+        cls, user_id: int, em_event_id: int
+    ) -> Optional[dict]:
+        """Любая запись пользователя на событие (включая отменённые) — для восстановления."""
         with get_connection() as conn:
             with conn.cursor(DictCursor) as cur:
                 cur.execute(

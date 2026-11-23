@@ -28,6 +28,7 @@ from telegram.ext import (
 from db.connection import get_connection
 from db.constants import CONSENT_TEXT, CONSENT_TEXT_VERSION
 from db.models import (
+    AuditLog,
     Booking,
     EventCache,
     Freeze,
@@ -742,7 +743,6 @@ async def book_event(
 ):
     """Обработка нажатия «Записаться» на занятие — запись по абонементу."""
     query = update.callback_query
-    await safe_answer(query)
 
     telegram_id = update.effective_user.id
     user = User.get_by_telegram_id(telegram_id)
@@ -750,6 +750,7 @@ async def book_event(
 
     if status in ("new", "deleted_data"):
         # Гость — предлагаем регистрацию
+        await safe_answer(query)
         context.user_data["pending_event_id"] = event_id
         text = (
             "\u26a0\ufe0f Чтобы записаться на занятие, нужно пройти регистрацию.\n\n"
@@ -766,6 +767,19 @@ async def book_event(
         ]
         await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
         return
+
+    # Окно регистрации: закрыто за 2 часа до занятия
+    ev = EventCache.get_by_em_event(event_id)
+    hours_until = _hours_until_event(ev)
+    if hours_until is not None and hours_until < 2:
+        await safe_answer(
+            query,
+            "Регистрация закрыта (менее 2 часов до занятия)",
+            show_alert=True,
+        )
+        return
+
+    await safe_answer(query)
 
     # 2. Активный абонемент (есть часы или безлимит)
     sub = Subscription.get_active_for_user(user["id"])
@@ -793,7 +807,6 @@ async def book_event(
         return
 
     # 4. Длительность занятия из events_cache (по умолчанию 1.0)
-    ev = EventCache.get_by_em_event(event_id)
     duration = _event_duration(ev)
 
     # 5. Хватает ли часов
@@ -823,15 +836,28 @@ async def book_event(
         await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
         return
 
-    # 7. Создаём запись
-    Booking.create(
-        user_id=user["id"],
-        em_event_id=event_id,
-        status="registered",
-        hours_charged=duration,
-        event_date=ev["start_date"] if ev else None,
-        event_time=ev["start_time"] if ev else None,
-    )
+    # 7. Создаём запись (если есть отменённая/прошедшая — восстанавливаем её,
+    #    т.к. на (user_id, em_event_id) стоит UNIQUE-индекс)
+    prev = Booking.get_any_by_user_and_event(user["id"], event_id)
+    if prev:
+        Booking.update(
+            prev["id"],
+            status="registered",
+            hours_charged=duration,
+            event_date=ev["start_date"] if ev else None,
+            event_time=ev["start_time"] if ev else None,
+            refunded=0,
+            cancelled_at=None,
+        )
+    else:
+        Booking.create(
+            user_id=user["id"],
+            em_event_id=event_id,
+            status="registered",
+            hours_charged=duration,
+            event_date=ev["start_date"] if ev else None,
+            event_time=ev["start_time"] if ev else None,
+        )
 
     # 8. Сообщение клиенту
     event_name = ev["name"] if ev else f"занятие #{event_id}"
@@ -1268,6 +1294,7 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
     # --- Регистрации на занятия ---
     last_booking = Booking.get_last_for_user(user["id"])
     active_bookings = Booking.get_active_for_user(user["id"])
+    cancel_available = False
 
     if last_booking:
         last_name = last_booking.get("event_name") or f"Событие #{last_booking['em_event_id']}"
@@ -1284,6 +1311,12 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             f"\n\u2705 Активная запись: {active_name} "
             f"({_format_date(active.get('event_date'))})"
         )
+        # Отмена доступна только более чем за 2 часа до занятия
+        hours_until = _hours_until_event(active)
+        if hours_until is not None and hours_until < 2:
+            text += "\nОтмена недоступна (менее 2 часов до занятия)"
+        else:
+            cancel_available = True
     else:
         text += "\n\u2705 Активная запись: Нет"
 
@@ -1299,7 +1332,7 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             ]
         )
-    if active_bookings:
+    if active_bookings and cancel_available:
         keyboard.append(
             [
                 InlineKeyboardButton(
@@ -1356,12 +1389,17 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
     await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
 
-def _booking_datetime(booking: dict) -> Optional[datetime]:
-    """Дата-время занятия из записи (event_date + event_time); None, если даты нет."""
-    event_date = booking.get("event_date")
+def _event_datetime(row: Optional[dict]) -> Optional[datetime]:
+    """
+    Дата-время занятия из строки (event_date/event_time — booking,
+    start_date/start_time — events_cache); None, если даты нет.
+    """
+    if not row:
+        return None
+    event_date = row.get("event_date") or row.get("start_date")
     if not event_date:
         return None
-    event_time = booking.get("event_time")
+    event_time = row.get("event_time") or row.get("start_time")
     if event_time is None:
         return datetime.combine(event_date, time.min)
     if isinstance(event_time, timedelta):
@@ -1375,6 +1413,14 @@ def _booking_datetime(booking: dict) -> Optional[datetime]:
         return datetime.combine(event_date, time(int(parts[0]), int(parts[1])))
     except (ValueError, IndexError):
         return datetime.combine(event_date, time.min)
+
+
+def _hours_until_event(row: Optional[dict]) -> Optional[float]:
+    """Часы до начала занятия; None, если дату вычислить нельзя."""
+    event_dt = _event_datetime(row)
+    if not event_dt:
+        return None
+    return (event_dt - datetime.now()).total_seconds() / 3600
 
 
 async def sub_reregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1421,61 +1467,153 @@ async def sub_reregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sub_cancel_active(
     update: Update, context: ContextTypes.DEFAULT_TYPE, booking_id: int
 ):
-    """Отмена регистрации: > 2 часов до занятия — возврат часов, иначе late_cancel."""
+    """Отмена регистрации: только более чем за 2 часа до занятия (возврат часов)."""
     query = update.callback_query
-    await safe_answer(query)
 
     telegram_id = update.effective_user.id
     user = User.get_by_telegram_id(telegram_id)
     if not user:
+        await safe_answer(query)
         await _safe_edit(query, "Ошибка загрузки. Нажмите /start.")
         return
 
     booking = Booking.get_by_id(booking_id)
     if not booking or booking["user_id"] != user["id"]:
+        await safe_answer(query)
         await _safe_edit(query, "\u26a0\ufe0f Запись не найдена.")
         return
     if booking["status"] != "registered":
+        await safe_answer(query)
         await _safe_edit(query, "\u26a0\ufe0f Эта запись уже отменена.")
         return
 
+    # Отмена возможна только более чем за 2 часа до занятия
+    hours_until = _hours_until_event(booking)
+    if hours_until is not None and hours_until < 2:
+        await safe_answer(
+            query,
+            "Отмена невозможна (менее 2 часов до занятия). Свяжитесь с админом.",
+            show_alert=True,
+        )
+        return
+
+    await safe_answer(query)
+
     ev = EventCache.get_by_em_event(booking["em_event_id"])
     event_name = ev["name"] if ev else f"Событие #{booking['em_event_id']}"
-    event_dt = _booking_datetime(booking)
     hours_charged = booking.get("hours_charged")
 
-    if event_dt and (event_dt - datetime.now()).total_seconds() > 2 * 3600:
-        # Больше 2 часов до занятия — возвращаем часы
-        if hours_charged:
-            sub = Subscription.get_active_for_user(user["id"])
-            if sub:
-                Subscription.refund_hours(sub["id"], float(hours_charged))
-        Booking.update(
-            booking_id,
-            status="cancelled",
-            cancelled_at=datetime.now(),
-            refunded=1,
-        )
-        client_name = user.get("full_name") or user.get("username") or f"ID {telegram_id}"
-        admin_msg = (
-            f"\u274c Отмена записи: {client_name} на {event_name} "
-            f"({_format_date(booking.get('event_date'))} "
-            f"{_format_time(booking.get('event_time'))}). Часы возвращены."
-        )
-        await notify_admin(context, admin_msg)
-        text = "\u2705 Регистрация отменена. Часы возвращены на абонемент."
-    else:
-        # Менее 2 часов (или дата неизвестна) — поздняя отмена, часы не возвращаем
-        Booking.update(
-            booking_id,
-            status="late_cancel",
-            cancelled_at=datetime.now(),
-        )
-        text = "\u26a0\ufe0f Регистрация отменена (поздняя отмена, часы не возвращены)."
+    # Возвращаем часы на абонемент
+    if hours_charged:
+        sub = Subscription.get_active_for_user(user["id"])
+        if sub:
+            Subscription.refund_hours(sub["id"], float(hours_charged))
 
-    await _safe_edit(query, text)
+    Booking.update(
+        booking_id,
+        status="cancelled",
+        cancelled_at=datetime.now(),
+        refunded=1,
+    )
+
+    # AuditLog
+    try:
+        AuditLog.create(
+            user_id=user["id"],
+            action="cancel_booking",
+            table_name="bookings",
+            record_id=booking_id,
+            new_value=json.dumps(
+                {
+                    "em_event_id": booking["em_event_id"],
+                    "status": "cancelled",
+                    "refunded": 1,
+                    "hours_charged": float(hours_charged) if hours_charged else None,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    except Exception as e:
+        logger.error("Не удалось записать audit_log: %s", e)
+
+    # Уведомления: админ + преподаватель
+    client_name = user.get("full_name") or user.get("username") or f"ID {telegram_id}"
+    date_str = _format_date(booking.get("event_date"))
+    time_str = _format_time(booking.get("event_time"))
+
+    admin_msg = (
+        f"\u274c Клиент {client_name} отменил запись на {event_name} "
+        f"({date_str} {time_str}). Часы возвращены."
+    )
+    await notify_admin(context, admin_msg)
+
+    teacher_id = ev.get("teacher_id") if ev else None
+    if teacher_id:
+        teacher = User.get_by_id(teacher_id)
+        teacher_tg = teacher.get("telegram_id") if teacher else None
+        if teacher_tg:
+            teacher_msg = (
+                f"\u274c Клиент {client_name} отменил запись к вам на {event_name} "
+                f"({date_str} {time_str})."
+            )
+            try:
+                await context.bot.send_message(chat_id=teacher_tg, text=teacher_msg)
+            except Exception as e:
+                logger.error(
+                    "Не удалось уведомить преподавателя %s: %s", teacher_id, e
+                )
+
+    await _safe_edit(
+        query, "\u2705 Регистрация отменена. Часы возвращены на абонемент."
+    )
     # Обновляем экран абонемента
     await show_my_subscription(update, context)
+
+
+async def send_reminders_24h(bot):
+    """
+    Напоминания о занятиях за ~24 часа (запускается ежечасно из JobQueue).
+    Находит записи, до начала которых от 23.5 до 24.5 часов, и пишет клиенту.
+    """
+    now = datetime.now()
+    with get_connection() as conn:
+        with conn.cursor(DictCursor) as cur:
+            cur.execute(
+                """SELECT b.id, b.user_id, b.em_event_id, b.event_date, b.event_time,
+                          e.name AS event_name, u.telegram_id
+                   FROM bookings b
+                   JOIN users u ON u.id = b.user_id
+                   LEFT JOIN events_cache e ON e.em_event_id = b.em_event_id
+                   WHERE b.status = 'registered'
+                     AND b.event_date IS NOT NULL
+                     AND b.event_time IS NOT NULL
+                     AND TIMESTAMP(b.event_date, b.event_time)
+                         BETWEEN NOW() - INTERVAL 2 HOUR AND NOW() + INTERVAL 48 HOUR""",
+            )
+            rows = cur.fetchall()
+
+    sent = 0
+    for row in rows:
+        # Точная фильтрация через datetime (не строки)
+        hours_until = _hours_until_event(row)
+        if hours_until is None or not (23.5 <= hours_until <= 24.5):
+            continue
+        telegram_id = row.get("telegram_id")
+        if not telegram_id:
+            continue
+        event_name = row.get("event_name") or f"Событие #{row['em_event_id']}"
+        time_str = _format_time(row.get("event_time"))
+        text = (
+            f"\U0001f514 Напоминаем: завтра в {time_str} у вас {event_name}. "
+            "Если не сможете прийти, отмените запись заранее."
+        )
+        try:
+            await bot.send_message(chat_id=telegram_id, text=text)
+            sent += 1
+        except Exception as e:
+            logger.error("Не удалось отправить напоминание %s: %s", telegram_id, e)
+    logger.info("Напоминания за 24 часа: отправлено %d", sent)
+    return sent
 
 
 async def show_subscription_history(
