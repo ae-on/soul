@@ -1184,6 +1184,21 @@ class EventCache(BaseModel):
                 return cur.fetchone()
 
     @classmethod
+    def get_next_24h(cls) -> list[dict]:
+        """События в ближайшие 24 часа (от NOW() до NOW()+24h) с именем преподавателя."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT e.*, COALESCE(NULLIF(u.full_name, ''), u.username) AS teacher_name
+                       FROM events_cache e
+                       LEFT JOIN users u ON u.id = e.teacher_id
+                       WHERE TIMESTAMP(e.start_date, e.start_time)
+                             BETWEEN NOW() AND NOW() + INTERVAL 24 HOUR
+                       ORDER BY e.start_date, e.start_time""",
+                )
+                return cur.fetchall()
+
+    @classmethod
     def get_teacher_names_for_date(cls, target_date) -> dict:
         """
         Имена преподавателей для событий в указанную дату.
@@ -1281,8 +1296,9 @@ class Booking(BaseModel):
                     return None
                 cur.execute(
                     """SELECT * FROM events_cache
-                       WHERE name = %s AND start_time = %s AND start_date > CURDATE()
-                       ORDER BY start_date ASC
+                       WHERE name = %s AND start_time = %s
+                         AND TIMESTAMP(start_date, start_time) > NOW()
+                       ORDER BY start_date, start_time
                        LIMIT 1""",
                     (last_ev["name"], last_ev["start_time"]),
                 )
@@ -1317,6 +1333,24 @@ class Booking(BaseModel):
                     (user_id, em_event_id),
                 )
                 return cur.fetchone()
+
+    @classmethod
+    def get_user_categories(cls, user_id: int) -> list[str]:
+        """Категории (category_slug), на которые клиент записывался ранее."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT DISTINCT e.category_slug
+                       FROM (
+                           SELECT em_event_id FROM bookings WHERE user_id = %s
+                           UNION
+                           SELECT em_event_id FROM visits WHERE user_id = %s
+                       ) x
+                       JOIN events_cache e ON e.em_event_id = x.em_event_id
+                       WHERE e.category_slug IS NOT NULL AND e.category_slug != ''""",
+                    (user_id, user_id),
+                )
+                return [row["category_slug"] for row in cur.fetchall()]
 
     @classmethod
     def get_by_event(cls, em_event_id: int) -> list[dict]:
