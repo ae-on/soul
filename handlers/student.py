@@ -564,8 +564,19 @@ async def show_schedule_day(
         if w.get("start_date") == target_str:
             day_events.append(ev)
 
-    # Сортировка по времени
-    day_events.sort(key=lambda ev: ev.get("when", {}).get("start_time", ""))
+    # Имена преподавателей из БД (events_cache LEFT JOIN users по teacher_id)
+    teacher_names = EventCache.get_teacher_names_for_date(selected_date)
+
+    def _loc_name(ev):
+        loc = ev.get("location")
+        if loc and isinstance(loc, dict) and loc.get("name"):
+            return loc["name"]
+        return ""
+
+    # Сортировка: сначала по названию зала, затем по времени начала
+    day_events.sort(
+        key=lambda ev: (_loc_name(ev), ev.get("when", {}).get("start_time", ""))
+    )
 
     # Заголовок верхний (с тегом, если есть)
     if tag_slug:
@@ -586,19 +597,14 @@ async def show_schedule_day(
         for ev in day_events:
             when = ev.get("when", {})
             time_str = when.get("start_time", "")[:5]
-
-            categories = ev.get("categories", [])
-            slug = categories[0].get("slug", "") if categories else ""
-            emoji = CATEGORY_EMOJI.get(slug, "\U0001f3ab")
-
             name = ev.get("name", "Без названия")
 
-            location_str = ""
-            location = ev.get("location")
-            if location and isinstance(location, dict) and location.get("name"):
-                location_str = f" \u00b7 \U0001f4cd {location['name']}"
+            hall = _loc_name(ev) or "Зал —"
+            teacher_name = teacher_names.get(ev.get("id"), "") or ""
 
-            line = f"\U0001f555 {time_str} \u00b7 {emoji} {name}{location_str}"
+            line = f"{hall} \u00b7 \U0001f555{time_str} \u00b7 {name}"
+            if teacher_name:
+                line += f" \u00b7 {teacher_name}"
             lines.append(line)
 
     # Заголовок дня — ПОСЛЕ списка событий

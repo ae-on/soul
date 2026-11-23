@@ -1170,6 +1170,28 @@ class EventCache(BaseModel):
                 return cur.fetchone()
 
     @classmethod
+    def get_teacher_names_for_date(cls, target_date) -> dict:
+        """
+        Имена преподавателей для событий в указанную дату.
+        LEFT JOIN events_cache с users по teacher_id.
+        Возвращает {em_event_id: teacher_name} (full_name или username).
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT e.em_event_id,
+                              COALESCE(NULLIF(u.full_name, ''), u.username) AS teacher_name
+                       FROM events_cache e
+                       LEFT JOIN users u ON u.id = e.teacher_id
+                       WHERE e.start_date = %s""",
+                    (target_date,),
+                )
+                return {
+                    row["em_event_id"]: (row["teacher_name"] or "")
+                    for row in cur.fetchall()
+                }
+
+    @classmethod
     def upsert(cls, em_event_id: int, **kwargs) -> bool:
         """Вставить или обновить событие в кэше."""
         cols = ", ".join(kwargs.keys())
