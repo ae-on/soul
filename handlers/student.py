@@ -9,7 +9,7 @@ import math
 import os
 import re
 import warnings
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 import aiohttp
@@ -28,6 +28,7 @@ from telegram.ext import (
 from db.connection import get_connection
 from db.constants import CONSENT_TEXT, CONSENT_TEXT_VERSION
 from db.models import (
+    Booking,
     EventCache,
     Freeze,
     Subscription,
@@ -711,17 +712,41 @@ async def show_schedule_day(
     await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
 
-async def book_event_stub(
+def _event_duration(ev: Optional[dict]) -> float:
+    """Длительность занятия в часах (end_time - start_time); 1.0, если неизвестна."""
+    if not ev:
+        return 1.0
+    start, end = ev.get("start_time"), ev.get("end_time")
+    if not start or not end:
+        return 1.0
+    try:
+        if hasattr(start, "total_seconds") and hasattr(end, "total_seconds"):
+            # TIME из MySQL приходит как timedelta
+            hours = (end - start).total_seconds() / 3600
+        else:
+            # Страховка: строковый формат "HH:MM[:SS]"
+            def _to_sec(v):
+                parts = str(v).split(":")
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + (
+                    int(parts[2]) if len(parts) > 2 else 0
+                )
+
+            hours = (_to_sec(end) - _to_sec(start)) / 3600
+        return round(hours, 1) if hours > 0 else 1.0
+    except (TypeError, ValueError, IndexError):
+        return 1.0
+
+
+async def book_event(
     update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: int
 ):
-    """Обработка нажатия «Записаться» на занятие — логика по статусу."""
+    """Обработка нажатия «Записаться» на занятие — запись по абонементу."""
     query = update.callback_query
     await safe_answer(query)
 
     telegram_id = update.effective_user.id
     user = User.get_by_telegram_id(telegram_id)
     status = user["status"] if user else "new"
-    email = None
 
     if status in ("new", "deleted_data"):
         # Гость — предлагаем регистрацию
@@ -739,26 +764,116 @@ async def book_event_stub(
             ],
             [InlineKeyboardButton("\U0001f519 К расписанию", callback_data="schedule")],
         ]
-    elif status in ("expired", "archived", "inactive"):
-        text = "\u26a0\ufe0f Ваш абонемент закончился. Купите новый, чтобы записаться."
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    # 2. Активный абонемент (есть часы или безлимит)
+    sub = Subscription.get_active_for_user(user["id"])
+    if not sub:
+        text = "\u26a0\ufe0f Нет активного абонемента."
         keyboard = [
             [
                 InlineKeyboardButton(
                     "\U0001f6cd\ufe0f Купить абонемент", callback_data="prices"
                 )
             ],
+            [InlineKeyboardButton("\U0001f519 К расписанию", callback_data="schedule")],
         ]
-    else:
-        # Активный ученик — заглушка записи
-        text = (
-            f"\u270d\ufe0f Запись на событие #{event_id}\n\n"
-            "Запись откроется в ближайшее время."
-        )
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    # 3. Уже записан на это занятие?
+    existing = Booking.get_by_user_and_event(user["id"], event_id)
+    if existing:
+        text = "\u2705 Вы уже записаны на это занятие."
         keyboard = [
             [InlineKeyboardButton("\U0001f519 К расписанию", callback_data="schedule")],
         ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
 
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    # 4. Длительность занятия из events_cache (по умолчанию 1.0)
+    ev = EventCache.get_by_em_event(event_id)
+    duration = _event_duration(ev)
+
+    # 5. Хватает ли часов
+    hours_left = sub.get("hours_left")
+    if hours_left is not None and float(hours_left) < duration:
+        text = (
+            f"\u26a0\ufe0f Недостаточно часов на абонементе.\n"
+            f"Нужно: {duration:g} ч., остаток: {float(hours_left):g} ч."
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "\U0001f6cd\ufe0f Купить абонемент", callback_data="prices"
+                )
+            ],
+            [InlineKeyboardButton("\U0001f519 К расписанию", callback_data="schedule")],
+        ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    # 6. Списываем часы
+    if not Subscription.deduct_hours(sub["id"], duration):
+        text = "\u26a0\ufe0f Не удалось списать часы. Попробуйте позже."
+        keyboard = [
+            [InlineKeyboardButton("\U0001f519 К расписанию", callback_data="schedule")],
+        ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    # 7. Создаём запись
+    Booking.create(
+        user_id=user["id"],
+        em_event_id=event_id,
+        status="registered",
+        hours_charged=duration,
+        event_date=ev["start_date"] if ev else None,
+        event_time=ev["start_time"] if ev else None,
+    )
+
+    # 8. Сообщение клиенту
+    event_name = ev["name"] if ev else f"занятие #{event_id}"
+    event_time_str = _format_time(ev["start_time"]) if ev else "—"
+    if hours_left is None:
+        remaining_str = "безлимит"
+    else:
+        remaining_str = f"{float(hours_left) - duration:g} ч."
+    text = (
+        f"\u2705 Вы записаны на {event_name} в {event_time_str}.\n"
+        f"Списано {duration:g} ч. Остаток: {remaining_str}."
+    )
+    keyboard = [
+        [InlineKeyboardButton("\U0001f519 К расписанию", callback_data="schedule")],
+    ]
+    await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+    # --- Уведомления: админ + преподаватель ---
+    client_name = user.get("full_name") or user.get("username") or f"ID {telegram_id}"
+    date_str = _format_date(ev["start_date"]) if ev else "—"
+
+    admin_msg = (
+        f"\U0001f514 Новая запись: {client_name} на {event_name} "
+        f"({date_str} {event_time_str})."
+    )
+    await notify_admin(context, admin_msg)
+
+    teacher_id = ev.get("teacher_id") if ev else None
+    if teacher_id:
+        teacher = User.get_by_id(teacher_id)
+        teacher_tg = teacher.get("telegram_id") if teacher else None
+        if teacher_tg:
+            teacher_msg = (
+                f"\U0001f514 {client_name} записался к вам на {event_name} "
+                f"({date_str} {event_time_str})."
+            )
+            try:
+                await context.bot.send_message(chat_id=teacher_tg, text=teacher_msg)
+            except Exception as e:
+                logger.error(
+                    "Не удалось уведомить преподавателя %s: %s", teacher_id, e
+                )
 
 
 async def show_direction_schedule(
@@ -1086,7 +1201,7 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
     telegram_id = update.effective_user.id
     user = User.get_by_telegram_id(telegram_id)
     if not user:
-        await query.edit_message_text("Ошибка загрузки. Нажмите /start.")
+        await _safe_edit(query, "Ошибка загрузки. Нажмите /start.")
         return
 
     sub = Subscription.get_active_for_user(user["id"])
@@ -1103,7 +1218,7 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             [InlineKeyboardButton("\U0001f4d6 Правила пользования", url=RULES_URL)],
             [InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")],
         ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
         return
 
     # --- Есть активный абонемент ---
@@ -1150,9 +1265,49 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     text = "\n".join(lines)
 
+    # --- Регистрации на занятия ---
+    last_booking = Booking.get_last_for_user(user["id"])
+    active_bookings = Booking.get_active_for_user(user["id"])
+
+    if last_booking:
+        last_name = last_booking.get("event_name") or f"Событие #{last_booking['em_event_id']}"
+        text += (
+            "\n\n\U0001f4dd Последняя запись: "
+            f"{last_name} ({_format_date(last_booking.get('event_date'))})"
+        )
+    else:
+        text += "\n\n\U0001f4dd Последняя запись: —"
+    if active_bookings:
+        active = active_bookings[0]
+        active_name = active.get("event_name") or f"Событие #{active['em_event_id']}"
+        text += (
+            f"\n\u2705 Активная запись: {active_name} "
+            f"({_format_date(active.get('event_date'))})"
+        )
+    else:
+        text += "\n\u2705 Активная запись: Нет"
+
     keyboard = [
         [InlineKeyboardButton("\U0001f4c5 История посещений", callback_data="sub_history")],
     ]
+    if last_booking:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001f4dd Зарегистрироваться повторно",
+                    callback_data="sub_reregister",
+                )
+            ]
+        )
+    if active_bookings:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "\u274c Отменить регистрацию",
+                    callback_data=f"sub_cancel_active_{active_bookings[0]['id']}",
+                )
+            ]
+        )
 
     # Кнопки заморозки — только если ещё не использована
     if (sub.get("freeze_used") or 0) == 0:
@@ -1199,6 +1354,128 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("\U0001f519 В меню", callback_data="back_to_main")]
     )
     await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+
+def _booking_datetime(booking: dict) -> Optional[datetime]:
+    """Дата-время занятия из записи (event_date + event_time); None, если даты нет."""
+    event_date = booking.get("event_date")
+    if not event_date:
+        return None
+    event_time = booking.get("event_time")
+    if event_time is None:
+        return datetime.combine(event_date, time.min)
+    if isinstance(event_time, timedelta):
+        # TIME из MySQL приходит как timedelta
+        return datetime.combine(event_date, (datetime.min + event_time).time())
+    if hasattr(event_time, "strftime"):
+        return datetime.combine(event_date, event_time)
+    # Страховка: строка "HH:MM[:SS]"
+    parts = str(event_time).split(":")
+    try:
+        return datetime.combine(event_date, time(int(parts[0]), int(parts[1])))
+    except (ValueError, IndexError):
+        return datetime.combine(event_date, time.min)
+
+
+async def sub_reregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Повторная запись на следующее занятие той же группы."""
+    query = update.callback_query
+    await safe_answer(query)
+
+    telegram_id = update.effective_user.id
+    user = User.get_by_telegram_id(telegram_id)
+    if not user:
+        await _safe_edit(query, "Ошибка загрузки. Нажмите /start.")
+        return
+
+    last = Booking.get_last_for_user(user["id"])
+    if not last:
+        text = "\u26a0\ufe0f Нет доступных будущих занятий для этой группы."
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "\U0001f519 К абонементу", callback_data="my_subscription"
+                )
+            ],
+        ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    next_ev = Booking.get_next_occurrence(last["em_event_id"])
+    if not next_ev:
+        text = "\u26a0\ufe0f Нет доступных будущих занятий для этой группы."
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "\U0001f519 К абонементу", callback_data="my_subscription"
+                )
+            ],
+        ]
+        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+        return
+
+    # book_event сам проверит абонемент, спишет часы и создаст запись
+    await book_event(update, context, next_ev["em_event_id"])
+
+
+async def sub_cancel_active(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, booking_id: int
+):
+    """Отмена регистрации: > 2 часов до занятия — возврат часов, иначе late_cancel."""
+    query = update.callback_query
+    await safe_answer(query)
+
+    telegram_id = update.effective_user.id
+    user = User.get_by_telegram_id(telegram_id)
+    if not user:
+        await _safe_edit(query, "Ошибка загрузки. Нажмите /start.")
+        return
+
+    booking = Booking.get_by_id(booking_id)
+    if not booking or booking["user_id"] != user["id"]:
+        await _safe_edit(query, "\u26a0\ufe0f Запись не найдена.")
+        return
+    if booking["status"] != "registered":
+        await _safe_edit(query, "\u26a0\ufe0f Эта запись уже отменена.")
+        return
+
+    ev = EventCache.get_by_em_event(booking["em_event_id"])
+    event_name = ev["name"] if ev else f"Событие #{booking['em_event_id']}"
+    event_dt = _booking_datetime(booking)
+    hours_charged = booking.get("hours_charged")
+
+    if event_dt and (event_dt - datetime.now()).total_seconds() > 2 * 3600:
+        # Больше 2 часов до занятия — возвращаем часы
+        if hours_charged:
+            sub = Subscription.get_active_for_user(user["id"])
+            if sub:
+                Subscription.refund_hours(sub["id"], float(hours_charged))
+        Booking.update(
+            booking_id,
+            status="cancelled",
+            cancelled_at=datetime.now(),
+            refunded=1,
+        )
+        client_name = user.get("full_name") or user.get("username") or f"ID {telegram_id}"
+        admin_msg = (
+            f"\u274c Отмена записи: {client_name} на {event_name} "
+            f"({_format_date(booking.get('event_date'))} "
+            f"{_format_time(booking.get('event_time'))}). Часы возвращены."
+        )
+        await notify_admin(context, admin_msg)
+        text = "\u2705 Регистрация отменена. Часы возвращены на абонемент."
+    else:
+        # Менее 2 часов (или дата неизвестна) — поздняя отмена, часы не возвращаем
+        Booking.update(
+            booking_id,
+            status="late_cancel",
+            cancelled_at=datetime.now(),
+        )
+        text = "\u26a0\ufe0f Регистрация отменена (поздняя отмена, часы не возвращены)."
+
+    await _safe_edit(query, text)
+    # Обновляем экран абонемента
+    await show_my_subscription(update, context)
 
 
 async def show_subscription_history(
@@ -1267,6 +1544,15 @@ async def show_subscription_history(
                 lines.append(
                     f"\U0001f4b3 {date_str} · Оплата: {amount_str} ({method}) · {type_name}"
                 )
+            elif item_type == "booking":
+                # Записи на занятия: регистрации и отмены
+                booking_status = (item.get("status") or "").lower()
+                event_name = item.get("event_name") or f"Событие #{item.get('em_event_id')}"
+                if booking_status == "registered":
+                    lines.append(f"\U0001f4dd {date_str} · Запись на {event_name}")
+                else:
+                    # cancelled / late_cancel
+                    lines.append(f"\u274c {date_str} · Отмена записи на {event_name}")
             else:
                 # — visit —
                 visit_status = (item.get("status") or "").lower()
@@ -2138,13 +2424,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_schedule_day(update, context, None, tag_slug=tag_slug)
         return
 
-    # --- Запись на событие (заглушка) ---
+    # --- Запись на событие ---
     if data.startswith("book_event_"):
         try:
             event_id = int(data[len("book_event_") :])
         except ValueError:
             event_id = 0
-        await book_event_stub(update, context, event_id)
+        await book_event(update, context, event_id)
         return
 
     # --- Подменю "Направления" ---
@@ -2215,6 +2501,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         except ValueError:
             pass
+
+    # --- Повторная запись на занятие ---
+    if data == "sub_reregister":
+        await sub_reregister(update, context)
+        return
+
+    # --- Отмена регистрации ---
+    if data.startswith("sub_cancel_active_"):
+        bid = _extract_int(data, "sub_cancel_active_")
+        if bid is not None:
+            await sub_cancel_active(update, context, bid)
+            return
 
     # Клиент: быстрая заморозка (без sub_id — берём активный абонемент)
     if data == "freeze_quick":

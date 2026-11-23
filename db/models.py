@@ -463,9 +463,9 @@ class User(BaseModel):
     @classmethod
     def get_history(cls, user_id: int, limit: int = 20) -> list[dict]:
         """
-        Объединённая история пользователя: покупки, заморозки, посещения.
+        Объединённая история пользователя: покупки, заморозки, посещения, записи.
         Сортировка по дате DESC. Каждая запись содержит 'type':
-        'purchase' | 'freeze' | 'visit'.
+        'purchase' | 'freeze' | 'visit' | 'booking' | 'audit' | 'payment'.
         """
         items = []
         with get_connection() as conn:
@@ -508,6 +508,20 @@ class User(BaseModel):
                 )
                 for row in cur.fetchall():
                     row["type"] = "visit"
+                    items.append(row)
+
+                # Записи на занятия (bookings): регистрации и отмены
+                cur.execute(
+                    """SELECT b.event_date AS date, b.status, b.em_event_id,
+                              e.name AS event_name
+                       FROM bookings b
+                       LEFT JOIN events_cache e ON e.em_event_id = b.em_event_id
+                       WHERE b.user_id = %s
+                         AND b.status IN ('registered', 'cancelled', 'late_cancel')""",
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    row["type"] = "booking"
                     items.append(row)
 
                 # Действия администратора (audit_log) по абонементам клиента
@@ -1214,17 +1228,65 @@ class Booking(BaseModel):
 
     @classmethod
     def get_active_for_user(cls, user_id: int) -> list[dict]:
-        """Все активные записи пользователя (не cancelled/late_cancel/no_show)."""
+        """
+        Будущие записи пользователя (status='registered', event_date >= CURDATE())
+        с названием события и временем из events_cache.
+        """
         with get_connection() as conn:
             with conn.cursor(DictCursor) as cur:
                 cur.execute(
-                    """SELECT * FROM bookings
-                       WHERE user_id = %s
-                         AND status IN ('registered', 'pending', 'confirmed')
-                       ORDER BY event_date, event_time""",
+                    """SELECT b.*, e.name AS event_name, e.start_time AS time_start
+                       FROM bookings b
+                       LEFT JOIN events_cache e ON e.em_event_id = b.em_event_id
+                       WHERE b.user_id = %s
+                         AND b.status = 'registered'
+                         AND b.event_date >= CURDATE()
+                       ORDER BY b.event_date, b.event_time""",
                     (user_id,),
                 )
                 return cur.fetchall()
+
+    @classmethod
+    def get_last_for_user(cls, user_id: int) -> Optional[dict]:
+        """Последняя запись пользователя (по дате создания), с названием события."""
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT b.*, e.name AS event_name, e.start_time AS time_start
+                       FROM bookings b
+                       LEFT JOIN events_cache e ON e.em_event_id = b.em_event_id
+                       WHERE b.user_id = %s
+                       ORDER BY b.created_at DESC
+                       LIMIT 1""",
+                    (user_id,),
+                )
+                return cur.fetchone()
+
+    @classmethod
+    def get_next_occurrence(cls, last_event_id: int) -> Optional[dict]:
+        """
+        Следующее событие той же группы (по name + start_time последнего события),
+        которое ещё не наступило. Возвращает dict из events_cache или None.
+        """
+        with get_connection() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    """SELECT name, start_time FROM events_cache
+                       WHERE em_event_id = %s
+                       LIMIT 1""",
+                    (last_event_id,),
+                )
+                last_ev = cur.fetchone()
+                if not last_ev:
+                    return None
+                cur.execute(
+                    """SELECT * FROM events_cache
+                       WHERE name = %s AND start_time = %s AND start_date > CURDATE()
+                       ORDER BY start_date ASC
+                       LIMIT 1""",
+                    (last_ev["name"], last_ev["start_time"]),
+                )
+                return cur.fetchone()
 
     @classmethod
     def get_by_user_and_event(cls, user_id: int, em_event_id: int) -> Optional[dict]:

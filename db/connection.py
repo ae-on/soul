@@ -9,6 +9,7 @@ import logging
 import os
 
 import pymysql
+import pymysql.cursors
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,7 +33,7 @@ def get_connection():
     Используется в init_db.py и скриптах миграций.
     """
     try:
-        conn = pymysql.connect(**DB_CONFIG)
+        conn = pymysql.connect(**DB_CONFIG, cursorclass=pymysql.cursors.DictCursor)
         logger.info(
             "Подключение к MySQL: %s@%s:%d/%s",
             DB_CONFIG["user"],
@@ -62,6 +63,7 @@ async def get_async_pool():
             db=DB_CONFIG["database"],
             charset="utf8mb4",
             autocommit=True,
+            cursorclass=aiomysql.DictCursor,
         )
         logger.info("Асинхронный пул MySQL создан")
         return pool

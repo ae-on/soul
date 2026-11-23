@@ -258,9 +258,9 @@ async def handle_admin_slots_sync(update: Update, context: ContextTypes.DEFAULT_
     # Сначала проверяем, что кэш вообще не пуст
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM events_cache")
+            cur.execute("SELECT COUNT(*) as cnt FROM events_cache")
             row = cur.fetchone()
-            total = row[0] if row else 0
+            total = row["cnt"] if row else 0
 
     if total == 0:
         await safe_answer(

@@ -59,7 +59,7 @@ def get_applied() -> set[str]:
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT version FROM schema_migrations")
-            return {row[0] for row in cur.fetchall()}
+            return {row["version"] for row in cur.fetchall()}
     except Exception:
         return set()
     finally:
