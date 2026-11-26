@@ -17,18 +17,30 @@ app = FastAPI(title="Soul Studio ERIP Webhook")
 @app.post("/erip/webhook")
 async def erip_webhook(request: Request):
     """
-    Принимает уведомления об оплате от ЕРИП (WebPay).
+    Принимает уведомления об оплате от ЕРИП (WebPay/bePaid).
 
-    Данные приходят как form-urlencoded (в старом PHP это было
-    file_get_contents('php://input')) — читаем их через request.form().
+    WebPay может слать данные как form-urlencoded (как в старом PHP),
+    так и JSON — обрабатываем оба варианта.
     """
+    data = {}
+    content_type = request.headers.get("content-type", "").lower()
+
     try:
-        data = await request.form()
-        # FormData -> dict для удобного логирования
-        data = dict(data)
-    except Exception as e:
-        logger.error("Ошибка при чтении вебхука от ЕРИП: %s", e)
-        data = {}
+        if "application/json" in content_type:
+            data = await request.json()
+        else:
+            # form-urlencoded (или любой другой тип) — читаем как форму
+            data = dict(await request.form())
+    except Exception:
+        # Страховка: контент-тип может не совпадать с реальным форматом
+        try:
+            data = await request.json()
+        except Exception:
+            try:
+                data = dict(await request.form())
+            except Exception as e:
+                logger.error("Ошибка при чтении вебхука от ЕРИП: %s", e)
+                data = {}
 
     logger.info(f"Получен вебхук от ЕРИП: {data}")
 
