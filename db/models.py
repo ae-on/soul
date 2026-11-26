@@ -1305,10 +1305,12 @@ class Booking(BaseModel):
                 if not last_ev:
                     return None
                 cur.execute(
-                    """SELECT * FROM events_cache
-                       WHERE name = %s AND start_time = %s
-                         AND TIMESTAMP(start_date, start_time) > NOW()
-                       ORDER BY start_date, start_time
+                    """SELECT e.*, COALESCE(NULLIF(u.full_name, ''), u.username) AS teacher_name
+                       FROM events_cache e
+                       LEFT JOIN users u ON u.id = e.teacher_id
+                       WHERE e.name = %s AND e.start_time = %s
+                         AND TIMESTAMP(e.start_date, e.start_time) > NOW()
+                       ORDER BY e.start_date, e.start_time
                        LIMIT 1""",
                     (last_ev["name"], last_ev["start_time"]),
                 )

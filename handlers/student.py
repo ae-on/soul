@@ -10,6 +10,7 @@ import os
 import re
 import warnings
 from datetime import date, datetime, time, timedelta
+from itertools import zip_longest
 from typing import Optional
 
 import aiohttp
@@ -287,8 +288,14 @@ async def sync_events_cache() -> int:
         start_time = when.get("start_time") or ev.get("event_start_time")
         end_time = when.get("end_time") or ev.get("event_end_time")
         category_slug = ev.get("category_slug") or ""
-        location_id = ev.get("location_id")
-        location_name = ev.get("location_name") or ""
+        # Локация: EM API отдаёт вложенно (location: {id, name}), плоские ключи — страховка
+        loc = ev.get("location")
+        if isinstance(loc, dict):
+            location_id = loc.get("id") or ev.get("location_id")
+            location_name = loc.get("name") or ""
+        else:
+            location_id = ev.get("location_id")
+            location_name = ev.get("location_name") or ""
 
         # Пропускаем битые события без даты (черновики, старые записи)
         if not start_date:
@@ -537,6 +544,9 @@ async def show_schedule_day(
     query = update.callback_query
     await safe_answer(query)
 
+    user = User.get_by_telegram_id(update.effective_user.id)
+    user_id = user["id"] if user else None
+
     # Определяем выбранную дату
     if date_str:
         try:
@@ -660,30 +670,24 @@ async def show_schedule_day(
 
         if i < len(left_events):
             ev = left_events[i]
-            time_str = ev.get("when", {}).get("start_time", "")[:5]
-            name = ev.get("name", "")
-            ev_id = ev["id"]
-            if ev_id in cart:
-                left_btn = InlineKeyboardButton(
-                    f"\u2705 {time_str} {name}", callback_data=f"cart_remove_{ev_id}"
-                )
-            else:
-                left_btn = InlineKeyboardButton(
-                    f"\u2795 {time_str} {name}", callback_data=f"cart_add_{ev_id}"
-                )
+            ev_norm = {
+                "em_event_id": ev["id"],
+                "name": ev.get("name", ""),
+                "start_date": ev.get("when", {}).get("start_date"),
+                "start_time": ev.get("when", {}).get("start_time"),
+            }
+            label, cb = _event_button_state(context, user_id, ev_norm)
+            left_btn = InlineKeyboardButton(label, callback_data=cb)
         if i < len(right_events):
             ev = right_events[i]
-            time_str = ev.get("when", {}).get("start_time", "")[:5]
-            name = ev.get("name", "")
-            ev_id = ev["id"]
-            if ev_id in cart:
-                right_btn = InlineKeyboardButton(
-                    f"\u2705 {time_str} {name}", callback_data=f"cart_remove_{ev_id}"
-                )
-            else:
-                right_btn = InlineKeyboardButton(
-                    f"\u2795 {time_str} {name}", callback_data=f"cart_add_{ev_id}"
-                )
+            ev_norm = {
+                "em_event_id": ev["id"],
+                "name": ev.get("name", ""),
+                "start_date": ev.get("when", {}).get("start_date"),
+                "start_time": ev.get("when", {}).get("start_time"),
+            }
+            label, cb = _event_button_state(context, user_id, ev_norm)
+            right_btn = InlineKeyboardButton(label, callback_data=cb)
 
         row = []
         if left_btn:
@@ -1458,6 +1462,12 @@ def _event_datetime(row: Optional[dict]) -> Optional[datetime]:
     event_date = row.get("event_date") or row.get("start_date")
     if not event_date:
         return None
+    if isinstance(event_date, str):
+        # Из API дата приходит строкой "YYYY-MM-DD"
+        try:
+            event_date = date.fromisoformat(event_date[:10])
+        except ValueError:
+            return None
     event_time = row.get("event_time") or row.get("start_time")
     if event_time is None:
         return datetime.combine(event_date, time.min)
@@ -1482,26 +1492,72 @@ def _hours_until_event(row: Optional[dict]) -> Optional[float]:
     return (event_dt - datetime.now()).total_seconds() / 3600
 
 
-def _event_button_label(ev: dict) -> str:
-    """Формат кнопки занятия: 🏠 18:00 Хатха Иванов."""
-    hall_icon = "\U0001f3e0"  # 🏠
-    loc = ev.get("location_name") or ""
-    if "Зал 2" in loc:
-        hall_icon = "\U0001f3e1"  # 🏡
+def _event_button_state(
+    context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int], ev: dict
+) -> tuple[str, str]:
+    """
+    Статус кнопки занятия: (текст, callback).
+    ✅ — уже записан (noop), 🛒 — в корзине (cart_remove),
+    🔒 — больше 24 часов / 🚫 — меньше 2 часов (book_event покажет alert),
+    ➕ — доступно (cart_add).
+    """
     time_str = _format_time(ev.get("start_time"))
-    name = ev.get("name") or "Занятие"
-    teacher_name = ev.get("teacher_name") or ""
+    name = (ev.get("name") or "Занятие")[:10]
+    ev_id = ev["em_event_id"]
+
+    # 1. Уже записан
+    if user_id and Booking.get_by_user_and_event(user_id, ev_id):
+        return f"\u2705 {time_str} {name}", "noop"
+    # 2. В корзине
+    cart = context.user_data.get("cart") or {}
+    if ev_id in cart:
+        return f"\U0001f6d2 {time_str} {name}", f"cart_remove_{ev_id}"
+    # 3-4. Окно регистрации (book_event покажет нужный alert)
+    hours_until = _hours_until_event(ev)
+    if hours_until is not None:
+        if hours_until > 24:
+            return f"\U0001f512 {time_str} {name}", f"book_event_{ev_id}"
+        if hours_until < 2:
+            return f"\U0001f6ab {time_str} {name}", f"book_event_{ev_id}"
+    # 5. Доступно для записи
+    return f"\u2795 {time_str} {name}", f"cart_add_{ev_id}"
+
+
+def _smart_reregister_button(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> Optional[InlineKeyboardButton]:
+    """
+    Кнопка «Записаться опять»: следующее занятие из последнего посещения.
+    None, если истории нет или расписание закончилось.
+    """
+    last = Booking.get_last_for_user(user_id)
+    if not last:
+        return None
+    next_ev = Booking.get_next_occurrence(last["em_event_id"])
+    if not next_ev:
+        return None
+    short_name = (next_ev.get("name") or "Занятие")[:10]
+    teacher_name = next_ev.get("teacher_name") or ""
     teacher_short = teacher_name.split()[0] if teacher_name.strip() else ""
-    label = f"{hall_icon} {time_str} {name}"
+    label = (
+        f"\U0001f501 {_format_date(next_ev.get('start_date'))} "
+        f"{_format_time(next_ev.get('start_time'))} {short_name}"
+    )
     if teacher_short:
         label += f" {teacher_short}"
-    return label
+    return InlineKeyboardButton(
+        label, callback_data=f"book_event_{next_ev['em_event_id']}"
+    )
 
 
 async def _render_registration_menu(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, events: list[dict], title: str
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    events: list[dict],
+    title: str,
+    user_id: Optional[int],
 ):
-    """Рендер экрана «Регистрация на занятие»: список занятий + корзина."""
+    """Рендер экрана «Регистрация на занятие»: сетка занятий в 2 столбца + корзина."""
     query = update.callback_query
     context.user_data["reg_events"] = events
     context.user_data["reg_title"] = title
@@ -1511,29 +1567,49 @@ async def _render_registration_menu(
     if not events:
         lines.append("Пока нет занятий в ближайшие 24 часа.")
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "\u2b50 По вашим предпочтениям", callback_data="reg_preferences"
-            )
-        ],
-    ]
-    cart = context.user_data.get("cart") or {}
+    keyboard = []
+
+    # Умная кнопка «Записаться опять» (если есть история и следующее занятие)
+    smart_btn = _smart_reregister_button(context, user_id) if user_id else None
+    if smart_btn:
+        keyboard.append([smart_btn])
+
+    # Сетка в два столбца: Зал 1 слева, Зал 2 справа (по названию зала)
+    hall1 = []
+    hall2 = []
     for ev in events:
-        ev_id = ev["em_event_id"]
-        if ev_id in cart:
-            label = f"\u2705 {_format_time(ev.get('start_time'))} {ev.get('name') or 'Занятие'}"
-            keyboard.append(
-                [InlineKeyboardButton(label, callback_data=f"cart_remove_{ev_id}")]
-            )
+        loc = ev.get("location_name") or ""
+        if "Зал 2" in loc:
+            hall2.append(ev)
         else:
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        _event_button_label(ev), callback_data=f"cart_add_{ev_id}"
-                    )
-                ]
-            )
+            hall1.append(ev)
+    hall1.sort(key=lambda e: e.get("start_time") or "")
+    hall2.sort(key=lambda e: e.get("start_time") or "")
+
+    # Заголовки залов
+    keyboard.append(
+        [
+            InlineKeyboardButton("\U0001f3e0 Зал 1", callback_data="noop"),
+            InlineKeyboardButton("\U0001f3e1 Зал 2", callback_data="noop"),
+        ]
+    )
+
+    # Кнопки занятий с учётом статусов (✅, 🛒, 🔒, 🚫, ➕)
+    for ev1, ev2 in zip_longest(hall1, hall2):
+        row = []
+        if ev1:
+            label, cb = _event_button_state(context, user_id, ev1)
+            row.append(InlineKeyboardButton(label, callback_data=cb))
+        else:
+            row.append(InlineKeyboardButton(" ", callback_data="noop"))
+        if ev2:
+            label, cb = _event_button_state(context, user_id, ev2)
+            row.append(InlineKeyboardButton(label, callback_data=cb))
+        else:
+            row.append(InlineKeyboardButton(" ", callback_data="noop"))
+        keyboard.append(row)
+
+    cart = context.user_data.get("cart") or {}
     if cart:
         keyboard.append(
             [
@@ -1542,14 +1618,6 @@ async def _render_registration_menu(
                 )
             ]
         )
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                "\U0001f501 Следующее из последнего посещения",
-                callback_data="reg_last_visited",
-            )
-        ]
-    )
     keyboard.append(
         [InlineKeyboardButton("\U0001f519 Назад", callback_data="my_subscription")]
     )
@@ -1560,79 +1628,16 @@ async def show_registration_menu(update: Update, context: ContextTypes.DEFAULT_T
     """Экран «Регистрация на занятие»: занятия на ближайшие 24 часа."""
     query = update.callback_query
     await safe_answer(query)
+    user = User.get_by_telegram_id(update.effective_user.id)
+    user_id = user["id"] if user else None
     events = EventCache.get_next_24h()
     await _render_registration_menu(
-        update, context, events, "\U0001f4c5 Доступные занятия на ближайшие 24 часа:"
+        update,
+        context,
+        events,
+        "\U0001f4c5 Доступные занятия на ближайшие 24 часа:",
+        user_id,
     )
-
-
-async def reg_preferences(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Занятия на 24ч по категориям, на которые клиент записывался ранее."""
-    query = update.callback_query
-    await safe_answer(query)
-    user = User.get_by_telegram_id(update.effective_user.id)
-    if not user:
-        await _safe_edit(query, "Ошибка загрузки. Нажмите /start.")
-        return
-    categories = Booking.get_user_categories(user["id"])
-    events = EventCache.get_next_24h()
-    if categories:
-        events = [ev for ev in events if ev.get("category_slug") in categories]
-    await _render_registration_menu(
-        update, context, events, "\u2b50 По вашим предпочтениям:"
-    )
-
-
-async def reg_last_visited(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Следующее занятие из последнего посещения."""
-    query = update.callback_query
-    await safe_answer(query)
-    user = User.get_by_telegram_id(update.effective_user.id)
-    if not user:
-        await _safe_edit(query, "Ошибка загрузки. Нажмите /start.")
-        return
-
-    last = Booking.get_last_for_user(user["id"])
-    if not last:
-        text = "У вас еще нет истории посещений."
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "\U0001f519 К регистрации", callback_data="sub_register_menu"
-                )
-            ],
-        ]
-        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
-        return
-
-    next_ev = Booking.get_next_occurrence(last["em_event_id"])
-    if not next_ev:
-        text = "Похоже, это направление больше не проводится."
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "\U0001f519 К регистрации", callback_data="sub_register_menu"
-                )
-            ],
-        ]
-        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
-        return
-
-    hours_until = _hours_until_event(next_ev)
-    if hours_until is not None and hours_until > 24:
-        text = "Регистрация откроется позже."
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "\U0001f519 К регистрации", callback_data="sub_register_menu"
-                )
-            ],
-        ]
-        await _safe_edit(query, text, InlineKeyboardMarkup(keyboard))
-        return
-
-    # До занятия < 24 часов — открываем запись (book_event проверит 2 часа и абонемент)
-    await book_event(update, context, next_ev["em_event_id"])
 
 
 async def _rerender_after_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1642,7 +1647,9 @@ async def _rerender_after_cart(update: Update, context: ContextTypes.DEFAULT_TYP
         title = context.user_data.get("reg_title") or (
             "\U0001f4c5 Доступные занятия на ближайшие 24 часа:"
         )
-        await _render_registration_menu(update, context, events, title)
+        user = User.get_by_telegram_id(update.effective_user.id)
+        user_id = user["id"] if user else None
+        await _render_registration_menu(update, context, events, title, user_id)
     else:
         ctx = context.user_data.get("schedule_ctx") or {}
         await show_schedule_day(update, context, ctx.get("date_str"), ctx.get("tag_slug"))
@@ -1921,11 +1928,12 @@ async def show_my_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"• {time_str} {name} ({date_str}) — отмена недоступна")
             continue
         lines.append(f"• {time_str} {name} ({date_str})")
+        short_name = name[:10]
         if b["id"] in cancel_cart:
             keyboard.append(
                 [
                     InlineKeyboardButton(
-                        f"\u2705 Выбрано: {time_str} {name}",
+                        f"\u2705 {time_str} {short_name}",
                         callback_data=f"cart_cancel_remove_{b['id']}",
                     )
                 ]
@@ -1934,7 +1942,7 @@ async def show_my_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append(
                 [
                     InlineKeyboardButton(
-                        f"\u2795 Отменить {time_str} {name}",
+                        f"\u2796 {time_str} {short_name}",
                         callback_data=f"cart_cancel_add_{b['id']}",
                     )
                 ]
@@ -3157,14 +3165,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Регистрация на занятие ---
     if data == "sub_register_menu":
         await show_registration_menu(update, context)
-        return
-
-    if data == "reg_preferences":
-        await reg_preferences(update, context)
-        return
-
-    if data == "reg_last_visited":
-        await reg_last_visited(update, context)
         return
 
     # --- Корзина записи ---
