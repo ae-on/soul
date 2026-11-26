@@ -430,9 +430,9 @@ class User(BaseModel):
     @classmethod
     def find_teacher_id(cls, email: str = None, name: str = None) -> Optional[int]:
         """
-        Находит ID пользователя по email (точно) или по full_name.
-        При поиске по имени порядок слов не важен: «Ирина Касач» найдёт
-        пользователя «Касач Ирина» (все слова должны присутствовать).
+        Находит ID пользователя по email (точно) или по имени.
+        Поиск по имени: слова в любом порядке («Инесса Волоховская» найдёт
+        «Волоховская Инесса»), также ищет в username.
         Возвращает None, если не найден.
         """
         with get_connection() as conn:
@@ -449,11 +449,21 @@ class User(BaseModel):
                 if name:
                     words = [w for w in name.split() if w]
                     if words:
-                        conditions = " AND ".join(["full_name LIKE %s"] * len(words))
-                        values = tuple(f"%{w}%" for w in words)
+                        # Паттерны в обоих порядках слов:
+                        # «%Инесса%Волоховская%» и «%Волоховская%Инесса%»
+                        pattern_forward = "%" + "%".join(words) + "%"
+                        pattern_reverse = "%" + "%".join(reversed(words)) + "%"
                         cur.execute(
-                            f"SELECT id FROM users WHERE {conditions} LIMIT 1",
-                            values,
+                            """SELECT id FROM users
+                               WHERE (full_name LIKE %s OR full_name LIKE %s)
+                                  OR (username LIKE %s OR username LIKE %s)
+                               LIMIT 1""",
+                            (
+                                pattern_forward,
+                                pattern_reverse,
+                                pattern_forward,
+                                pattern_reverse,
+                            ),
                         )
                         row = cur.fetchone()
                         if row:

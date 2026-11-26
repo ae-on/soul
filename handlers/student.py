@@ -326,7 +326,9 @@ async def sync_events_cache() -> int:
         # Находим преподавателя: сначала по email, затем по имени
         teacher_id = None
         if owner_email or owner_name:
+            logger.info(f"Ищем препода: name={owner_name}, email={owner_email}")
             teacher_id = User.find_teacher_id(owner_email, owner_name)
+            logger.info(f"Результат поиска: {teacher_id}")
         if not teacher_id:
             logger.info("Не найден преподаватель для события %s (email=%s, name=%s)", em_id, owner_email, owner_name)
 
@@ -2080,7 +2082,8 @@ async def send_reminders_24h(bot):
     """
     now = datetime.now()
     with get_connection() as conn:
-        with conn.cursor(DictCursor) as cur:
+        # DictCursor настроен глобально в db/connection.py
+        with conn.cursor() as cur:
             cur.execute(
                 """SELECT b.id, b.user_id, b.em_event_id, b.event_date, b.event_time,
                           e.name AS event_name, u.telegram_id
