@@ -273,6 +273,8 @@ async def sync_events_cache() -> int:
         return 0
 
     count = 0
+    # Уникальные преподаватели, которых не удалось привязать (сводка в конце)
+    not_found_teachers = set()
     for ev in events:
         em_id = ev.get("id")
         if not em_id:
@@ -326,11 +328,13 @@ async def sync_events_cache() -> int:
         # Находим преподавателя: сначала по email, затем по имени
         teacher_id = None
         if owner_email or owner_name:
-            logger.info(f"Ищем препода: name={owner_name}, email={owner_email}")
             teacher_id = User.find_teacher_id(owner_email, owner_name)
-            logger.info(f"Результат поиска: {teacher_id}")
         if not teacher_id:
-            logger.info("Не найден преподаватель для события %s (email=%s, name=%s)", em_id, owner_email, owner_name)
+            # Не спамим лог на каждое событие — копим имена для сводки в конце
+            if owner_name:
+                not_found_teachers.add(owner_name)
+            elif owner_email:
+                not_found_teachers.add(owner_email)
 
         # Upsert в кэш — по одной записи на каждую дату
         for d in date_list:
@@ -351,7 +355,11 @@ async def sync_events_cache() -> int:
             except Exception as e:
                 logger.error("Ошибка при сохранении события %s: %s", em_id, e)
 
-    logger.info("Скачано %d событий, сохранено %d", len(events), count)
+    logger.info(f"Синхронизация: получено {len(events)} событий, сохранено {count}")
+    if not_found_teachers:
+        logger.warning(
+            f"Не удалось привязать преподавателей: {', '.join(sorted(not_found_teachers))}"
+        )
     return count
 
 
